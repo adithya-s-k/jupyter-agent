@@ -200,3 +200,5 @@ training-data
 models
 
 .claude
+# External reference repos cloned for design — not part of this codebase.
+references/

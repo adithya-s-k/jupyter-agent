@@ -1,0 +1,32 @@
+# rl/-specific ignores. The top-level .gitignore covers __pycache__, .venv,
+# .env, *.egg-info, logs/, etc. Only add things unique to this folder here.
+# NOTE: gitignore does NOT support inline `#` comments — comments must be on
+# their own line, otherwise the trailing text becomes part of the pattern.
+
+# ── Heavy / generated artifacts ───────────────────────────────────────────
+# Source dataset cache (~163 GB) + HF datasets/xet caches.
+cache/
+
+# Generated Harbor task suites. Canonical home is the HF Hub dataset repo
+# `<user>/jupyter-agent-<slug>-harbor`. Always regeneratable via
+# `prepare/build_harbor_tasks.py --name <slug>`.
+harbor/tasks/
+
+# `harbor run` job outputs (per-trial logs, configs, results).
+jobs/
+
+# Local harbor run logs we tee to files.
+logs/
+
+# ── Tooling junk ──────────────────────────────────────────────────────────
+.kaggle/
+*.bak
+.DS_Store
+
+# ── Local IDE / editor state ──────────────────────────────────────────────
+.idea/
+.vscode/
+
+# ── Local-only env override (defensive parity with top-level .gitignore) ──
+.env
+.env.local

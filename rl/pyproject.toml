@@ -1,0 +1,43 @@
+[project]
+name = "jupyter-agent-rl"
+version = "0.1.0"
+description = "SFT + RL pipeline for Jupyter Agent: dataset prep, OpenReward env, smoke-test rollouts, Harbor harness."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "datasets",
+    # huggingface_hub >= 1.12 is required for the Buckets API (sync_bucket,
+    # download_bucket_files, batch_bucket_files). hf_xet is auto-installed
+    # with huggingface_hub >= 0.32. Do NOT use hf_transfer — it was removed
+    # in huggingface_hub 1.x; tune downloads via HF_XET_HIGH_PERFORMANCE=1
+    # instead.
+    "huggingface_hub>=1.12",
+    "pyarrow",
+    "pandas",
+    "pydantic>=2",
+    "python-dotenv",
+    "tqdm",
+    "openai>=1.40",
+    "anthropic>=0.40",
+    # Harbor's [e2b] extra requires e2b>=2.4.2; e2b-code-interpreter is not in
+    # use yet (it'll be the ORS server's sandbox once we write it). Re-pin both
+    # together later if needed.
+    "e2b>=2.4.2",
+    "kagglehub",
+    "openreward>=0.1.33",
+    "transformers",
+]
+
+# OpenReward and Harbor are installed separately; both have strict resolver
+# constraints (harbor pins newer Python, openreward isn't on PyPI for all
+# platforms). Install them in their own venvs / sub-environments as needed:
+#   uv pip install openreward
+#   uv pip install --prerelease=allow 'harbor>=0.3.0a1'
+# See rl/README.md.
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["prepare"]
