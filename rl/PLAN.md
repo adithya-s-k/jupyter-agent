@@ -1,6 +1,10 @@
-# Jupyter Agent — Current Pipeline (iterate here)
+# Jupyter Agent — Pipeline Plan
 
-Snapshot of where we are right now, what each script does, and what we've verified working.
+Two stages. **Stage 1 is shipped** (commit `83a1949`). **Stage 2 is the next build** — an OpenReward (ORS) server that exposes the same 5 jupyter tools as `JupyterToolAgent`, for RL training rollouts.
+
+---
+
+# Stage 1 — Harbor task suite + HF Bucket (DONE)
 
 ---
 
@@ -181,9 +185,334 @@ Same task spec across all rows. Same HF Bucket as the data source. Different san
 
 ---
 
-## Open questions for you
+---
 
-1. Drop the local `data/<prefix>/` mirror? Saves ~150 MB local for the 5-task slice; bigger savings at N=1000.
-2. Standardize on `--env e2b` for everything (consistency across local + cloud) or keep `--env docker` as the default for fast iteration?
-3. Default model for our pass-rate baseline: `openai/gpt-5` or `anthropic/claude-sonnet-4-5`? (Either works; gpt-5 is cheaper, sonnet may be more reliable.)
-4. Build the OpenReward server next (RL path), or do a wider Harbor eval first (5 tasks × N models)?
+# Stage 2 — OpenReward server that delegates to Harbor (NEXT)
+
+## The core idea (revised)
+
+Stage 1 already built the right sandbox abstraction: `harbor.environments.factory.create_environment(...)` understands our `task.toml` + `Dockerfile` + healthcheck-driven bucket pull, and works across `docker | e2b | modal | daytona | runloop | gke | apple-container`.
+
+**Stage 2 reuses that.** The OpenReward server is a thin shell that:
+1. Reads the same Harbor task folders.
+2. Asks Harbor's factory for a sandbox per session (`await env.start()` + `await env.run_healthcheck()`).
+3. Exposes 5 `@tool` methods that just `await env.exec(...)` against the Harbor-managed container.
+4. Grades `final_answer` inline via `grader.py` + a structured-output LLM judge.
+
+**Zero re-implementation of sandboxing.** Harbor handles Docker/E2B/Modal/healthcheck/bucket-pull/build. OpenReward handles HTTP protocol, sessions, per-call rewards. The 5 tools are the bridge.
+
+## Why this exists
+
+Stage 1 gives us **batch eval** (Harbor `run` over a static task suite). Stage 2 gives us **in-the-loop training**: each rollout is one session against a long-lived HTTP service that returns rewards per tool call. That's the shape TRL/SkyRL want.
+
+Two consumers of the same ORS server:
+1. **Direct rollout** (`rl/rollouts/`) — `openreward.EnvironmentsAPI` client + an LLM (OpenAI/Anthropic/our SFT model). Used for RL training rollouts and standalone debugging.
+2. **Harbor proxy agent** (`rl/harbor_agents/ors_proxy.py`, optional) — thin Harbor `BaseAgent` that talks to the ORS server instead of running a kernel inside the Harbor container. Lets Harbor batch eval reuse the ORS env without duplicating tool logic.
+
+The ORS server is one process. **Locally**: `python -m env.server` → `localhost:8080`, sandboxes spawned in E2B via the code-interpreter SDK. **Hosted (future)**: same code, push to HF Space, anyone hits it via `EnvironmentsAPI(base_url=...)`.
+
+## Goal — exact deliverables
+
+1. A working `python -m env.server` that exposes the 5 jupyter tools over the ORS HTTP protocol.
+2. Tasks loaded from our Harbor folders (`harbor/tasks/jupyter-agent-<slug>/`) — using `harbor.models.task.task.Task(task_dir)` to parse, not custom code.
+3. Per-session sandbox via `harbor.environments.factory.EnvironmentFactory.create_environment(...)` + `await env.start(force_build=False)` + `await env.run_healthcheck()`. Bucket pull happens inside the healthcheck, not in our code.
+4. Reward computed inline in `final_answer` via shared `rl/grader.py` + structured-output LLM judge (`AsyncOpenAI.beta.chat.completions.parse(response_format=Verdict)`).
+5. A standalone `rl/rollouts/rollout.py` that drives the env via `openreward.EnvironmentsAPI` + an OpenAI model. Verified by reproducing the 4/10 pass-rate from Stage 1 against `--name v1`.
+6. (Stretch) `rl/harbor_agents/ors_proxy.py` so Harbor eval can reuse the ORS env. Optional in this stage.
+
+## Architecture
+
+```
+   hf://datasets/<user>/<base>-harbor      hf://buckets/<user>/<base>-data
+   (spec, Stage 1)                         (data, Stage 1)
+                  │                            │
+                  └──────────────┬─────────────┘
+                                 │
+                                 ▼  imports
+        ┌────────────────────────────────────────────────────────┐
+        │  harbor.environments.factory.EnvironmentFactory        │
+        │    .create_environment(type=docker|e2b|…, …)           │
+        │    → BaseEnvironment with:                             │
+        │       async start(force_build)                         │
+        │       async run_healthcheck()    ← runs pull_bucket.py │
+        │       async exec(command, …)                           │
+        │       async upload_file(...)                           │
+        │       async stop(delete=True)                          │
+        └──────────────────┬─────────────────────────────────────┘
+                           │  composed inside →
+                           ▼
+   ┌─────────────────────────────────────────────────────────────────┐
+   │  env/server.py  (openreward.environments.Server.run)            │
+   │                                                                 │
+   │   class JupyterAgentEnv(Environment):                           │
+   │     def __init__(self, task_spec, secrets):                     │
+   │       # parse task.toml via harbor.models.task.task.Task        │
+   │       # build TrialPaths + EnvironmentConfig                    │
+   │       # self._henv = EnvironmentFactory.create_environment(…)   │
+   │       # self.grader = AsyncOpenAI(api_key=secrets["OPENAI_…"])  │
+   │                                                                 │
+   │     async def setup(self):                                      │
+   │       await self._henv.start(force_build=False)                 │
+   │       await self._henv.run_healthcheck()   ← bucket lands here  │
+   │       await self._henv.upload_file(kernel_server.py, /opt/…)    │
+   │       await self._henv.exec("nohup python3 /opt/kernel_server.py &")
+   │                                                                 │
+   │     async def teardown(self):                                   │
+   │       await self._henv.stop(delete=True)                        │
+   │                                                                 │
+   │     @tool async def add_and_execute_code_cell(self, params):    │
+   │       r = await self._henv.exec("python3 /opt/run_cell.py …")   │
+   │       return ToolOutput(blocks=[…], reward=0.0, finished=False) │
+   │                                                                 │
+   │     @tool async def final_answer(self, params):                 │
+   │       # exact + numeric tiers from grader.grade(...)            │
+   │       # if miss → AsyncOpenAI.beta.chat.completions.parse(      │
+   │       #     response_format=Verdict, …)                         │
+   │       return ToolOutput(reward=r, finished=True)                │
+   │                                                                 │
+   │   Server([JupyterAgentEnv]).run(host=0.0.0.0, port=8080)        │
+   └─────────────────────────────────────────────────────────────────┘
+                         ▲
+                         │ HTTP (REST + SSE), openreward.EnvironmentsAPI
+                         │
+        ┌────────────────┴────────────────┬───────────────────────┐
+        │                                 │                       │
+   rollouts/rollout_openai.py    (stretch) harbor_agents/   (Stage 3) trl_grpo.py
+   - openreward client           ors_proxy.py               - reward_fn → ORS
+   - tool loop + LLM             - Harbor BaseAgent that      session.call_tool
+   - cumulative reward             talks to local ORS       - GRPO updates
+```
+
+## File layout (revised — leaner because Harbor does the sandbox work)
+
+```
+rl/
+├── env/                                ← NEW (this stage)
+│   ├── __init__.py
+│   ├── server.py                       ← JupyterAgentEnv + Server.run(); ~200 LOC
+│   ├── verdict.py                      ← Pydantic `Verdict(BaseModel)` for structured-output judge
+│   ├── README.md                       ← how to run + deploy notes
+│   └── (no e2b_sandbox.py, no notebook_tracker.py, no tasks_loader.py)
+│        ↑ Harbor's BaseEnvironment makes those redundant.
+│
+├── rollouts/                           ← NEW (this stage)
+│   ├── __init__.py
+│   ├── rollout_openai.py               ← openreward.EnvironmentsAPI client + OpenAI tool loop
+│   └── rollout_anthropic.py            ← same shape, Anthropic tool-use API
+│
+└── harbor_agents/                       ← Stage 1 (already shipped)
+    ├── jupyter.py                      ← uses kernel_server.py too — shared infra
+    ├── kernel_server.py                ← SAME file uploaded into Harbor container by both runtimes
+    ├── run_cell.py                     ← SAME file
+    └── (stretch) ors_proxy.py           ← Harbor BaseAgent that proxies to localhost:8080 ORS
+```
+
+**What is NOT duplicated:** `kernel_server.py`, `run_cell.py`, the Dockerfile, `pull_bucket.py`, `grader.py`. Stage 2 vendors all of these by importing or uploading from Stage 1's locations.
+
+## Implementation order
+
+1. **Pin `harbor==0.6.6`** in `pyproject.toml` — Harbor doesn't declare API stability and we want a reproducible base.
+
+2. **Write `env/list_tasks_helper.py`** — walk `HARBOR_SUITE_DIR`, parse each `task.toml` via `harbor.models.task.task.Task(task_dir)`, return:
+   ```python
+   [{
+       "id": task_dir.name,
+       "task_dir": str(task_dir),
+       "instruction": (task_dir / "instruction.md").read_text(),
+       "gold_answer": t.config.verifier.env.get("EXPECTED_ANSWER"),
+       "question":    t.config.verifier.env.get("QUESTION"),
+   }, ...]
+   ```
+
+3. **Write `env/verdict.py`** — Pydantic Verdict + Enum schema for the LLM-judge structured output:
+   ```python
+   from enum import Enum
+   from pydantic import BaseModel
+   class JudgeVerdict(str, Enum):
+       CORRECT = "CORRECT"; INCORRECT = "INCORRECT"; NOT_ATTEMPTED = "NOT_ATTEMPTED"
+   class JudgeOut(BaseModel):
+       verdict: JudgeVerdict
+       reasoning: str
+   ```
+
+3. **Write `env/server.py`** — `class JupyterAgentEnv(Environment)`. Mirror Harbor's `Trial.__init__`:
+   ```python
+   def __init__(self, task_spec, secrets):
+       super().__init__(task_spec)
+       task_dir = Path(task_spec["task_dir"])
+       self._task = Task(task_dir)                                          # parses task.toml
+       self._session_id = uuid.uuid4().hex[:12]                             # container-unique
+
+       # Per-session scratch dir (Harbor bind-mounts subdirs of this)
+       trial_dir = Path(tempfile.mkdtemp(prefix=f"ors-{self._session_id}-"))
+       self._trial_paths = TrialPaths(trial_dir=trial_dir)
+       self._trial_paths.mkdir()                                            # ← REQUIRED
+
+       # Mirror Trial.__init__ exactly
+       self._henv = EnvironmentFactory.create_environment_from_config(
+           config=self._task.config.environment,
+           environment_dir=task_dir / "environment",
+           environment_name=f"ors-{task_spec['id']}-{self._session_id[:8]}",
+           session_id=self._session_id,
+           trial_paths=self._trial_paths,
+           task_env_config=self._task.config.environment,
+           logger=logging.getLogger(__name__),
+       )
+
+       self.grader_client = AsyncOpenAI(api_key=secrets["OPENAI_API_KEY"])
+       self._kernel_started = False
+
+   @classmethod
+   def list_splits(cls):
+       return [Split(name="train"), Split(name="eval")]
+
+   @classmethod
+   def list_tasks(cls, split):
+       suite_dir = Path(os.environ["HARBOR_SUITE_DIR"])
+       return [...read each task_dir...]                                    # see step 2
+
+   def get_prompt(self):
+       return [TextBlock(text=self.task_spec["instruction"])]
+
+   async def setup(self):
+       await self._henv.start(force_build=False)
+       await self._henv.run_healthcheck()                                   # bucket lands HERE
+       if self._henv.capabilities.mounted:
+           self._trial_paths.chmod_dir()                                    # ← REQUIRED if mounted
+       await self._henv.upload_file(KERNEL_SERVER_PATH, "/opt/kernel_server.py")
+       await self._henv.upload_file(RUN_CELL_PATH, "/opt/run_cell.py")
+       await self._henv.exec("nohup setsid python3 /opt/kernel_server.py >/tmp/k.log 2>&1 &")
+       # poll http://127.0.0.1:8765/ until 200
+       self._kernel_started = True
+
+   async def teardown(self):
+       await self._henv.stop(delete=True)
+       shutil.rmtree(self._trial_paths.trial_dir, ignore_errors=True)
+   ```
+   Then 5 `@tool async def` methods (canonical pattern documented in `using-llm-graders`).
+
+4. **Tool implementations**:
+   ```python
+   @tool
+   async def add_and_execute_code_cell(self, params: CodeCellParams) -> ToolOutput:
+       b64 = base64.b64encode(params.code.encode()).decode()
+       r = await self._henv.exec(f"python3 /opt/run_cell.py --code-b64 {b64}", timeout_sec=180)
+       payload = json.loads(r.stdout or '{"output":"","ok":false}')
+       return ToolOutput(blocks=[TextBlock(text=payload["output"])], reward=0.0, finished=False)
+
+   @tool
+   async def final_answer(self, params: FinalAnswerParams) -> ToolOutput:
+       # Tier 1+2: deterministic
+       res = grade(self.task_spec["gold_answer"], params.answer, judge=False)
+       if res.reward == 0.0 and self.task_spec.get("question"):
+           # Tier 3: structured-output LLM judge
+           resp = await self.grader_client.beta.chat.completions.parse(
+               model="gpt-4o-mini",
+               messages=[{"role": "user", "content": JUDGE_PROMPT.format(
+                   question=self.task_spec["question"],
+                   gold=self.task_spec["gold_answer"],
+                   pred=params.answer,
+               )}],
+               response_format=JudgeOut,                                    # Pydantic schema
+               temperature=0,
+           )
+           verdict = resp.choices[0].message.parsed.verdict
+           reward = 1.0 if verdict == JudgeVerdict.CORRECT else 0.0
+       else:
+           reward = res.reward
+       return ToolOutput(blocks=[TextBlock(text="ok")], reward=reward, finished=True)
+   ```
+
+5. **Smoke-test the server**: `HARBOR_SUITE_DIR=harbor/tasks/jupyter-agent-v1 python -m env.server &` then `curl http://localhost:8080/list_environments` → should return `["jupyteragentenv"]`. Then `curl /environments/jupyteragentenv/tasks/train`.
+
+6. **Write `rl/rollouts/rollout_openai.py`** — modeled on `references/RL_Envs_101/envs/jupyter_env/ors/rollout.py`:
+   - args: `--task-id` or `--task-index`, `--model`, `--max-turns`
+   - reads `ORS_URL` (default `http://localhost:8080`), `ORS_ENV_NAME` (default `jupyteragentenv`)
+   - opens `with env.session(task=task, secrets={"OPENAI_API_KEY": ...}) as s`
+   - multi-turn OpenAI tool-calling loop using `s.call_tool(name, args)`
+   - prints cumulative reward + final answer
+
+7. **Verify reward parity with Stage 1** — run `rollouts/rollout_openai.py --task-id 0082_302_82302927_qa_3 --model openai/gpt-5`. Must produce `reward=1.0` and a predicted value in the same numeric band (~0.749x) as Stage 1's Harbor run. Exact match impossible (LLM stochasticity even at temperature=0), pass-rate parity is the right check.
+
+8. **(Stretch) `harbor_agents/ors_proxy.py`** — Harbor `BaseAgent` that opens an `EnvironmentsAPI` session against `localhost:8080` and proxies tool calls. Reuses the Stage 1 task suite + verifier. Pure thin shim (~80 LOC).
+
+9. **(Future) Push the ORS env to HF Spaces** — `env/Dockerfile` + GHA workflow. Mirror `references/RL_Envs_101/envs/jupyter_env/ors/` (deployed at `AdithyaSK/jupyter-agent-ors`). Then anyone runs `EnvironmentsAPI(base_url="https://<user>-jupyter-agent.hf.space")`.
+
+## Locked decisions
+
+| | |
+|--|--|
+| **Tools** | Exactly the 5 from `references/RL_Envs_101/envs/jupyter_env/ors/server.py` and `harbor_agents/jupyter.py`. Same names, same input schemas. |
+| **Reward shape** | `final_answer` returns `ToolOutput(reward=grader_result, finished=True)`. Other tools return `reward=0.0, finished=False`. No per-call shaping in v1; revisit when training. |
+| **Sandbox backend** | **`harbor.environments.factory.EnvironmentFactory.create_environment(...)` — same code-path as `harbor run`.** No re-implementation. Sandbox type picked via `HARBOR_ENV_TYPE` env var (`docker | e2b | modal | …`). |
+| **Bucket pull** | Via Harbor's `[environment.healthcheck]` calling `pull_bucket.py` — explicitly invoked with `await self._henv.run_healthcheck()`. Same script Stage 1 ships. |
+| **Kernel** | `harbor_agents/kernel_server.py` uploaded into the Harbor container at session setup. Stateful Python via persistent globals over HTTP. Shared infra with `JupyterToolAgent`. |
+| **Task source** | `harbor/tasks/jupyter-agent-<slug>/` folders on disk. `HARBOR_SUITE_DIR` env var controls the slug. Parsed via `harbor.models.task.task.Task(task_dir)`. |
+| **Grader** | `rl/grader.py` shared with Stage 1's `tests/grader.py`. Exact + numeric tiers same. **LLM-judge tier upgraded to structured output via `AsyncOpenAI.beta.chat.completions.parse(response_format=JudgeOut)`** — no regex. |
+| **Secrets** | OpenReward injects per-session via the `secrets` dict in `Environment.__init__`. Client side passes `secrets={"OPENAI_API_KEY": ..., "HF_TOKEN": ..., "E2B_API_KEY": ...}` when opening a session. |
+| **Async** | All Harbor I/O is async (`start`, `stop`, `exec`, `upload_file`, `run_healthcheck`). Our `@tool` methods are `async def` accordingly. |
+| **Harbor version** | `harbor==0.6.6` pinned. No declared API stability — bump deliberately, not auto. |
+
+## What this unlocks once shipped
+
+- **TRL/SkyRL training** — point the trainer at the ORS HTTP endpoint, treat each rollout as one episode against the env. Per-call rewards mean GRPO/PPO can shape behavior across tool calls, not just on the final answer.
+- **Cross-platform eval** — same 5-tool surface as Harbor + the JupyterToolAgent. Numbers from `rollout_openai.py` (ORS) and `harbor run -a opencode` (Harbor) should match on the same task + model + grader, since they share `grader.py`.
+- **Public env** — push the ORS server to HF Spaces and the eval becomes a single-URL service anyone can run rollouts against. (Out of scope this stage, but the design is the same.)
+
+## Risks called out by research
+
+These came out of the audit pass against `openrewardstandard/python-sdk` and `harbor-framework/harbor` source:
+
+1. **No public adapter exists.** OpenReward's "Harbor mode" is a closed-source server-side feature on openreward.ai. We are writing the first public `Environment` subclass that imports `harbor.environments`. Building blocks are all public.
+2. **Healthcheck is not auto-run by `start()`.** Easy to miss. Must explicitly `await env.run_healthcheck()` after `start()`, otherwise the agent runs before `pull_bucket.py` lands files.
+3. **`TrialPaths` requires side-effects.** `TrialPaths(trial_dir=...)` is a frozen dataclass with only `trial_dir` required, BUT you MUST call:
+   - `trial_paths.mkdir()` — creates `agent/`, `verifier/`, `artifacts/` subdirs (Docker bind-mounts fail without them).
+   - `trial_paths.chmod_dir()` — only if `env.capabilities.mounted` is True (non-root users need to write to mounted dirs).
+4. **`environment_dir` must already contain the Dockerfile + healthcheck files**. Use `task_dir/"environment"` from our Stage 1 layout — Harbor doesn't synthesize.
+5. **`session_id` must be unique per concurrent session** — used as the container name. Generate via `uuid.uuid4().hex[:12]` per session.
+6. **Use `EnvironmentFactory.create_environment_from_config`, not the raw `create_environment`** — `Trial.__init__` (Harbor's own caller) uses the `_from_config` variant. Mirror it exactly.
+7. **All Harbor methods are async** — `@tool async def`, `await env.exec(...)`. OpenReward's `@tool` decorator transparently handles both sync and async via `await maybe_await(fn(inp))` (verified in `src/ors/environment.py`).
+8. **Harbor version drift.** Pin `harbor==0.6.6`. Their pydantic models for `EnvironmentConfig` / `Task` / `TrialPaths` may break on minor releases.
+9. **Reference repo `references/RL_Envs_101/envs/jupyter_env/ors/` uses the E2B Code Interpreter SDK directly.** We're *not* following that path — Harbor's factory abstracts E2B, Docker, Modal, Daytona behind one interface. Reference is for tool-shape only.
+
+## The Trial.__init__ pattern we mirror
+
+Verbatim from `harbor.trial.trial.Trial.__init__` (the canonical Harbor caller for `EnvironmentFactory`):
+
+```python
+# Harbor's own code — this is what `harbor run` does internally
+self._trial_paths = TrialPaths(trial_dir=self.trial_dir)
+self._trial_paths.mkdir()
+
+self._environment = EnvironmentFactory.create_environment_from_config(
+    config=config.environment,                       # trial-level EnvironmentConfig
+    environment_dir=self._task.paths.environment_dir,  # <task_dir>/environment/
+    environment_name=self._task.name,                # used as container name
+    session_id=self.config.trial_name,               # unique per trial
+    trial_paths=self._trial_paths,
+    task_env_config=self._task.config.environment,   # the [environment] block from task.toml
+    logger=self._logger,
+)
+
+if self._environment.capabilities.mounted:
+    self._trial_paths.chmod_dir()
+```
+
+Our `env/server.py` does exactly this inside `Environment.__init__`. Plus `await self._henv.start(force_build=False)` + `await self._henv.run_healthcheck()` in `setup()`.
+
+## Open questions
+
+1. **Single ORS server per slug, or one server multiplexing all slugs?** Simplest: one server, slug selected by `HARBOR_SUITE_DIR` at startup. If we want a permanent service, multiplex via the `Split` API (`v1-train`, `v1-eval`, `v2-train`, ...).
+2. **Sandbox type at runtime: `docker` or `e2b`?** Both work via `HARBOR_ENV_TYPE`. **Default: `docker`** for local dev (fast cold-start, free); **deploy mode: `e2b`** (scales horizontally for many parallel rollouts).
+3. **One sandbox per session, or sandbox pool?** Per-session is simplest; pool is the optimization once we hit RL rollout throughput. Start per-session.
+4. **Hosted deploy now or later?** Local-only first. Hosted is a 2-file diff (`Dockerfile` + GHA workflow) once the local server works.
+
+## Sources
+
+- [Deploying Harbor Environments — OpenReward](https://docs.openreward.ai/environments/deploying-harbor-environments)
+- [Using LLM Graders — OpenReward](https://docs.openreward.ai/environments/using-llm-graders)
+- [Your First Environment — OpenReward](https://docs.openreward.ai/environments/your-first-environment)
+- [Harbor source — github.com/harbor-framework/harbor](https://github.com/harbor-framework/harbor)
+- [`harbor==0.6.6` on PyPI](https://pypi.org/project/harbor/)
+- [`openreward==0.1.81` on PyPI](https://pypi.org/project/openreward/)
+- [Reference repo: RL_Envs_101 jupyter_env/ors](https://github.com/adithya-s-k/RL_Envs_101/tree/main/envs/jupyter_env/ors)
