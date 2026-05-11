@@ -187,7 +187,133 @@ Same task spec across all rows. Same HF Bucket as the data source. Different san
 
 ---
 
-# Stage 2 — OpenReward server that delegates to Harbor (NEXT)
+# Stage 3 — Scale audit, optimizations, benchmark roadmap
+
+Stages 1 + 2 work end-to-end at N=10. This section is the honest answer to "what would break at N=1000, what to optimize, and how to turn this into a published benchmark."
+
+## Scalability bounds (measured + projected)
+
+### Stage 1 — build → bucket → Hub
+
+| Phase | At N=10 today | Projected at N=500 | Projected at N=5000 | Bottleneck |
+|---|---|---|---|---|
+| `build_harbor_tasks` filter + dedupe | ~10 s | ~30 s | ~5 min | parquet scan (single-threaded) |
+| Kagglehub downloads (parallel, 4 workers) | 8 s for 10 unique | ~40 min for 500 unique | ~7 h for 5000 unique | Kaggle API rate limit + per-dataset size |
+| Local data mirror disk | 144 MB | ~10 GB | ~100 GB | local disk |
+| `stage_data` bucket sync (Xet) | 32 s | ~25 min | ~4 h | xet upload throughput; cross-dataset chunk dedup helps a lot |
+| `push_harbor` Hub upload (spec only) | 8 s | ~15 s | ~60 s | tiny — spec files are KB |
+| Bucket cost (private, $18/TB·mo) | $0.003 | $0.18 | $1.80 | negligible |
+| Dataset repo size | 552 KB | ~30 MB | ~300 MB | well under git limits |
+
+**Verdict for Stage 1**: scales to **5000 tasks** without architectural change. Three concrete tunings to apply:
+
+1. **Bump `--max-workers` to 16–32** for `build_harbor_tasks.py` and `stage_data.py`. Kaggle and HF buckets both handle that throughput.
+2. **Resume-on-failure**: persist a `staged.jsonl` checkpoint per dataset; skip those on re-run. Already partial; finish it.
+3. **Streaming pipeline**: don't wait for full kagglehub batch to finish before starting bucket syncs. Pipeline the two stages.
+
+### Stage 2 — ORS server + rollouts
+
+| Concern | At N=1 today (verified) | At ~50 concurrent rollouts | At ~500 concurrent rollouts |
+|---|---|---|---|
+| Server process | single asyncio loop | single, fine | needs replicas behind a load balancer |
+| Sandbox provider | docker local | docker pool or e2b | e2b cloud (only realistic option) |
+| Container cold-start per session | ~30 s (incl. bucket pull) | same | **dominates** unless we pool/cache |
+| Kernel server boot inside container | ~1 s | same | same |
+| LLM inference | seconds per turn | OpenAI/Anthropic rate limits matter | needs higher-tier API quotas |
+| Cost per rollout (gpt-5, 7 turns, ~80k toks) | ~$0.05 | same per-rollout | $25 / batch of 500 |
+
+**Bottleneck order** (where time is actually spent on a single rollout, measured):
+
+1. **LLM inference** (~25 s of the 40 s end-to-end) — model + token volume
+2. **Container start + healthcheck/bucket pull** (~10 s) — same files re-fetched every session
+3. **Kernel server boot + readiness poll** (~1 s)
+4. **Actual code execution** (~few s in our examples)
+
+## Optimizations (ordered by ROI, cheapest first)
+
+| # | Optimization | Files touched | Expected win | Risk |
+|---|---|---|---|---|
+| 1 | **Mount a persistent host volume at `/root/.cache/huggingface/xet`** in the Harbor container so the bucket pull hits the local xet cache between sessions on the same machine. | `ors/server.py` (pass `mounts_json` via `TrialEnvironmentConfig`) | -5 to -25 s per session after first run | low |
+| 2 | **`force_build=False`** + share the Dockerfile across all tasks in a suite | already done (Stage 1's bucket-only Dockerfile is identical per task → image cached automatically) | one ~30 s build per suite, not per task | — |
+| 3 | **Sandbox pool** (pre-warm N idle containers, hand them out per session) | `ors/server.py` — wrap `EnvironmentFactory.create_environment_from_config` in a pool | -10 to -30 s cold-start per session | medium — need to reset kernel state between sessions |
+| 4 | **`hf-mount` lazy FUSE mount of the bucket** instead of `pull_bucket.py` upfront pull | `harbor/tasks/<base>/<id>/environment/Dockerfile` + `pull_bucket.py` | sub-second first-byte for big datasets; pays off when only a slice is read | medium — FUSE needs sandbox provider support; E2B + Modal yes, others varies |
+| 5 | **Parallel rollouts** in the eval driver (`rollouts/rollout_openai.py --n-concurrent K`) | new arg + `asyncio.gather` | K-x throughput up to OpenAI rate limit | low |
+| 6 | **Switch sandbox to E2B for batch runs** | `HARBOR_ENV_TYPE=e2b` env var, already wired | horizontal scale beyond one host | low — E2B template build is slow first time but cached after |
+| 7 | **Hosted ORS on HF Space** | new `ors/Dockerfile` + GHA | zero client-side setup; one URL anyone can hit | medium — HF Space resource limits |
+| 8 | **Cache the LLM-judge verdict** by `(gold, pred)` hash | small key-value file or sqlite | -1 API call when re-running same answers | trivial |
+| 9 | **Async OpenAI client + parallel tool-call dispatch** when model emits multiple tool calls in one turn | `rollouts/rollout_openai.py` | minor; rare in practice for these tasks | low |
+| 10 | **Multi-replica ORS server** behind nginx | infra, no code change | unbounded horizontal scale | high — production work |
+
+**Recommended order to actually do**: 1, 2 (already done), 8 (trivial), 5, then 3 or 6 depending on whether we lean local or cloud-first.
+
+## Benchmark roadmap — turning this into something publishable
+
+What we have today (`jupyter-agent-v1`, 10 tasks) is **a smoke test, not a benchmark**. To stand up a real benchmark:
+
+### 1. Scale the task set to N≥200
+
+10 tasks is statistically noisy. SWE-bench_Verified has 500. A reasonable target:
+
+- `--n-tasks 200` for a public eval set
+- `--n-tasks 1000` for a held-out training set (separate slug)
+- Two slugs: `--name eval-v1` (200 frozen) and `--name train-v1` (1000+)
+- The same `prepare/build_harbor_tasks.py` script we already have; just bump `--n-tasks` and run.
+
+### 2. Lock evaluation methodology
+
+A benchmark needs *fixed* answers to:
+
+- **Sampling**: deterministic seed already in place (`--seed 42`). Document the candidate filter (e.g., "executor_type=e2b, has non-null answer, dedup by `(kaggle, question)` keeping highest `edu_score`").
+- **Grader**: lock `grader.py` to the version that produces the leaderboard numbers. **Pin `gpt-4o-mini` as the judge** so judge drift doesn't move scores across leaderboard submissions.
+- **Agent / scaffold**: define one canonical reference agent (opencode + the JupyterToolAgent are good baselines).
+- **Sandbox**: pin `--env docker` or `--env e2b` so resource limits are equal across submissions.
+- **Pass@1 vs Pass@k**: pick one (start with pass@1; cheap to compute).
+
+### 3. Versioning
+
+- Tag everything: dataset slug + bucket + git commit. `jupyter-agent-eval-v1` is immutable once published.
+- Bucket is mutable, so use Xet `xet_hash` snapshots — record per-file hashes in `manifest.jsonl` so we can verify nothing drifted.
+
+### 4. Reporting layout
+
+Each submission produces a `jobs/` directory. Aggregate into a leaderboard row:
+
+```jsonl
+{"model":"openai/gpt-5","agent":"opencode","env":"docker","pass_at_1":0.40,"n_tasks":10,"timestamp":"…","cost_usd":0.587,"job_dir":"jobs/v1-opencode-gpt5"}
+```
+
+A tiny script: `scripts/leaderboard.py` reads multiple `jobs/*/result.json` files, emits leaderboard CSV + markdown.
+
+### 5. Distribution
+
+- HF Dataset repo (the spec repo, already done): the canonical task suite.
+- HF Bucket (the data, already done): the canonical files.
+- **HF Space** (new): an interactive leaderboard. Users submit `jobs/...` tarball; the Space scores and re-ranks. Or static markdown in the dataset repo README.
+- **Paper / blog**: methodology + baseline numbers.
+
+### 6. Sanity checks before calling it a benchmark
+
+- ≥ 200 tasks
+- ≥ 3 baseline models reported (e.g., gpt-4o-mini, gpt-5, claude-sonnet-4-5)
+- ≥ 2 baseline agents reported (opencode, JupyterToolAgent)
+- Grader determinism: re-run 1 task 10 times, same model, ensure reward is stable (or document the variance)
+- Cost transparency: report `cost_usd` per task
+
+## Concrete next 3 steps
+
+If you want to move toward a benchmark this week:
+
+1. **Generate `--name eval-v1 --n-tasks 200`** and push (Stage 1 already supports this; ~40 min build + bucket sync).
+2. **Run all 3 baselines** (opencode×gpt-4o-mini, opencode×gpt-5, JupyterToolAgent×gpt-5) on `eval-v1`. Cost rough estimate: 200 × $0.05 × 3 ≈ $30. Time: ~3 h with `-n 4` concurrent Harbor.
+3. **Write `scripts/leaderboard.py`** that aggregates `jobs/*/result.json` files into a single markdown table. Put the table in `eval-v1`'s Hub README.
+
+After that, the benchmark is live in a publishable form. Stage 4 (RL training against the env to *improve* pass-rate) is a separate effort.
+
+---
+
+# Stage 2 — OpenReward server that delegates to Harbor (DONE — commit `00d4cdd`)
+
+End-to-end verified on the insurance task: reward 1.0, 7 turns, 40.8 s. Reference implementation lives at `rl/ors/server.py` + `rl/ors/list_tasks_helper.py` + `rl/ors/verdict.py` + `rl/rollouts/rollout_openai.py`. The notes below describe the design that was actually shipped.
 
 ## The core idea (revised)
 
