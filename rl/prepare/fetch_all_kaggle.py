@@ -402,7 +402,12 @@ def main() -> int:
                 extra += f" → {entry['bucket_prefix']}"
             if entry.get("error"):
                 extra += f"  err={entry['error'][:60]}"
-            tqdm.write(f"  [{tag:7s}] {name}  ({entry['n_source_rows']} rows){extra}")
+            # Use plain print to avoid tqdm.write's WeakSet race across worker threads
+            # (sync_bucket + kagglehub each spawn their own tqdm instances).
+            try:
+                tqdm.write(f"  [{tag:7s}] {name}  ({entry['n_source_rows']} rows){extra}")
+            except RuntimeError:
+                print(f"  [{tag:7s}] {name}  ({entry['n_source_rows']} rows){extra}", flush=True)
             pbar.update(1)
             pbar.set_postfix(
                 ok=status_counts.get("uploaded", 0) + status_counts.get("downloaded", 0),
