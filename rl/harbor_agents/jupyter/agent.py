@@ -52,6 +52,8 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from .._shared import parse_model, provider_credentials
+
 
 # ---------------------------------------------------------------------------
 # Tool schema — copied verbatim from references/RL_Envs_101/envs/jupyter_env/ors
@@ -207,26 +209,6 @@ class JupyterToolAgent(BaseAgent):
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _parse_model(name: str | None) -> tuple[str, str]:
-        """Return (provider, bare_model_id).
-
-        openai/gpt-5                                  → ('openai', 'gpt-5')
-        anthropic/claude-sonnet-4-6                   → ('anthropic', 'claude-sonnet-4-6')
-        hf/Qwen/Qwen3-235B-A22B-Instruct-2507:nscale  → ('hf', 'Qwen/Qwen3-235B-A22B-Instruct-2507:nscale')
-        gpt-5  (no prefix)                            → ('openai', 'gpt-5')  (back-compat)
-        """
-        if not name:
-            return "openai", "gpt-4o-mini"
-        for prefix, provider in (
-            ("openai/", "openai"),
-            ("anthropic/", "anthropic"),
-            ("hf/", "hf"),
-        ):
-            if name.startswith(prefix):
-                return provider, name[len(prefix):]
-        return "openai", name
-
     async def _exec_cell(self, env: BaseEnvironment, code: str) -> tuple[str, bool]:
         """Send code to kernel_server and return (output, ok)."""
         b64 = base64.b64encode(code.encode("utf-8")).decode()
@@ -369,26 +351,11 @@ class JupyterToolAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        provider, model_id = self._parse_model(self.model_name)
-        t0 = time.time()
-
-        # All three providers go through the OpenAI client; only base_url + key
-        # differ. Anthropic exposes an OpenAI-compat shim at api.anthropic.com/v1,
-        # HF Inference exposes one at router.huggingface.co/v1.
-        if provider == "openai":
-            api_key = os.environ.get("OPENAI_API_KEY")
-            base_url = None
-        elif provider == "anthropic":
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            base_url = "https://api.anthropic.com/v1/"
-        elif provider == "hf":
-            api_key = os.environ.get("HF_TOKEN")
-            base_url = "https://router.huggingface.co/v1"
-        else:
-            raise RuntimeError(f"unknown provider in model={self.model_name!r}")
-
+        provider, model_id = parse_model(self.model_name)
+        api_key, base_url = provider_credentials(provider)
         if not api_key:
             raise RuntimeError(f"API key missing for provider={provider}")
+        t0 = time.time()
 
         messages, tracker = await self._run_openai_compat(
             instruction, environment, model_id, api_key, base_url=base_url,

@@ -54,8 +54,8 @@ from ors.verdict import JUDGE_PROMPT, JudgeOut, JudgeVerdict
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RL_ROOT = REPO_ROOT / "rl"
-KERNEL_SERVER = RL_ROOT / "harbor_agents" / "kernel_server.py"
-RUN_CELL = RL_ROOT / "harbor_agents" / "run_cell.py"
+KERNEL_SERVER = RL_ROOT / "harbor_agents" / "jupyter" / "kernel_server.py"
+RUN_CELL = RL_ROOT / "harbor_agents" / "jupyter" / "run_cell.py"
 
 load_dotenv(REPO_ROOT / ".env")
 
