@@ -23,6 +23,80 @@ Bucket prefix convention: `kaggle_dataset_name.replace("/", "__")` — e.g. `4qu
 | `skipped.jsonl` | 1 dataset manually skipped (`4quant/eye-gaze` — 11 GB for 1 source row) |
 | `fetch_all_kaggle.jsonl` | Raw append-only run report (resumable index) |
 | `source_index.parquet` | `id, kaggle_dataset_name, executor_type` from the source split — for reverse lookup |
+| `eval_v1/` | 100-task eval split (see [Eval split](#eval-split-eval_v1) below) |
+
+## Eval split (`_meta/eval_v1/`)
+
+The 100-task public eval suite at [`AdithyaSK/jupyter-agent-eval-v1-harbor`](https://huggingface.co/datasets/AdithyaSK/jupyter-agent-eval-v1-harbor) is built from a fixed list of source-row ids.
+
+**Exclusion is row-level, not dataset-level.** Each row in the source dataset is one `(kaggle_dataset, question)` pair — e.g. `0001_573_1573460_qa_5`. Only those exact rows are held out of training. The underlying Kaggle dataset (`mmoreaux/audio-cats-and-dogs` in that example) is free to appear in many other train rows with different questions. That's intentional — Kaggle datasets are scarce (786 unique total), questions are plentiful (~29k), and the agent needs to generalise across questions on the same data.
+
+The exclusion list lives in the bucket so every machine that builds a train suite can pull it without going through the source repo.
+
+| File | Contents | Size |
+|---|---|---|
+| `eval_v1/eval_ids.txt` | 100 source-row ids, one per line. The canonical exclusion list. | 2.9 KB |
+| `eval_v1/eval_manifest.parquet` | Full per-row metadata: `id, question, answer, kaggle_dataset_name, difficulty, llm_score, feat_*`. Use for audit / inspection. | 35 KB |
+| `eval_v1/candidates.parquet` | All 2,000 LLM-scored candidates the eval was sampled from. Useful if you want to expand the eval or use a different stratification. | 345 KB |
+
+### Composition (as of 2026-05-13)
+
+| Bucket | Count | Unique Kaggle datasets | LLM score range |
+|---|---|---|---|
+| easy   | 50 | 47 | 1–2 |
+| medium | 25 | 24 | 3 |
+| hard   | 25 | 23 | 4–5 |
+| **Total** | **100** | **94** | 1–5 |
+
+Within each bucket: tiers ~⅓ each (basic pandas / +viz / +ML), answer types ~½ numeric / ½ string, max 2 tasks per Kaggle dataset.
+
+### Use it: drop eval ids from a train build
+
+```bash
+# 1. Pull the exclusion list from the bucket (one-liner; no HF dataset clone needed).
+python - <<'PY'
+from huggingface_hub import HfApi
+HfApi().download_bucket_files(
+    "AdithyaSK/jupyter-agent-kaggle-all",
+    files=[("_meta/eval_v1/eval_ids.txt", "cache/eval/eval_ids.txt")],
+)
+PY
+
+# 2. Build train suite with the exclusion in effect.
+uv run python -m prepare.build_harbor_tasks \
+    --name train-v1 --n-tasks 1500 \
+    --exclude-ids cache/eval/eval_ids.txt \
+    --data-bucket-id AdithyaSK/jupyter-agent-kaggle-all \
+    --skip-data-download
+```
+
+`build_harbor_tasks.py`'s `--exclude-ids` filters the dedup pool by `id` (row-level), so the exact eval `(kaggle, question)` rows are never seen during training. Other rows from the same Kaggle datasets are kept — the agent can train on `mmoreaux/audio-cats-and-dogs` with all questions *except* `…_qa_5` (which is in eval).
+
+### Quick check: how often does the same Kaggle dataset show up in both?
+
+```python
+import pyarrow.parquet as pq
+from huggingface_hub import HfApi
+HfApi().download_bucket_files(
+    "AdithyaSK/jupyter-agent-kaggle-all",
+    files=[("_meta/eval_v1/eval_manifest.parquet", "/tmp/eval.parquet")],
+)
+eval_df = pq.read_table("/tmp/eval.parquet").to_pandas()
+print(f"{len(eval_df)} eval rows across {eval_df.kaggle_dataset_name.nunique()} unique Kaggle datasets")
+# 100 eval rows across 94 unique Kaggle datasets → ~6 datasets contribute 2 eval rows,
+# the rest contribute 1. ~700 Kaggle datasets remain fully available for training.
+```
+
+### Inspect the eval
+
+```python
+import pyarrow.parquet as pq
+df = pq.read_table(
+    "hf://buckets/AdithyaSK/jupyter-agent-kaggle-all/_meta/eval_v1/eval_manifest.parquet"
+).to_pandas()
+print(df.groupby('difficulty').size())
+df[df.difficulty == 'hard'][['id','question','answer','llm_score']].head()
+```
 
 ## Numbers (as of 2026-05-12)
 

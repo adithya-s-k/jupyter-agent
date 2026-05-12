@@ -480,9 +480,9 @@ def llm_to_bucket(score: int) -> str:
 
 
 def stratified_sample(
-    candidates: list[dict], n_per_bucket: int, max_per_kaggle: int, seed: int,
+    candidates: list[dict], counts: dict[str, int], max_per_kaggle: int, seed: int,
 ) -> list[dict]:
-    """Pick `n_per_bucket` each from easy/medium/hard with diversity caps."""
+    """Pick `counts[bucket]` rows per difficulty bucket with diversity caps."""
     by_bucket: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
     for r in candidates:
         by_bucket[llm_to_bucket(r["llm_score"])].append(r)
@@ -490,6 +490,9 @@ def stratified_sample(
     rng = random.Random(seed)
     chosen: list[dict] = []
     for bucket_name in ("easy", "medium", "hard"):
+        target = counts.get(bucket_name, 0)
+        if target <= 0:
+            continue
         pool = by_bucket[bucket_name]
         rng.shuffle(pool)
 
@@ -502,10 +505,10 @@ def stratified_sample(
         picked: list[dict] = []
         cell_keys = list(cells.keys())
         rng.shuffle(cell_keys)
-        # Iterate cells round-robin until we hit n_per_bucket
-        while len(picked) < n_per_bucket and any(cells[k] for k in cell_keys):
+        # Iterate cells round-robin until we hit target
+        while len(picked) < target and any(cells[k] for k in cell_keys):
             for k in cell_keys:
-                if len(picked) >= n_per_bucket:
+                if len(picked) >= target:
                     break
                 while cells[k]:
                     cand = cells[k].pop(0)
@@ -517,26 +520,26 @@ def stratified_sample(
 
         # If under-quota, fill from leftover ignoring cell balance but keeping
         # the kaggle cap.
-        if len(picked) < n_per_bucket:
+        if len(picked) < target:
             leftover = [r for r in pool if r not in picked]
             for cand in leftover:
-                if len(picked) >= n_per_bucket:
+                if len(picked) >= target:
                     break
                 if per_kaggle[cand["kaggle_dataset_name"]] >= max_per_kaggle:
                     continue
                 picked.append(cand)
                 per_kaggle[cand["kaggle_dataset_name"]] += 1
 
-        if len(picked) < n_per_bucket:
-            print(f"[warn] only {len(picked)}/{n_per_bucket} for bucket={bucket_name} "
+        if len(picked) < target:
+            print(f"[warn] only {len(picked)}/{target} for bucket={bucket_name} "
                   f"(pool={len(pool)}); relaxing kaggle cap as last resort")
             leftover = [r for r in pool if r not in picked]
             for cand in leftover:
-                if len(picked) >= n_per_bucket:
+                if len(picked) >= target:
                     break
                 picked.append(cand)
 
-        print(f"[bucket={bucket_name}] picked={len(picked)} "
+        print(f"[bucket={bucket_name}] picked={len(picked)}/{target} "
               f"unique_kaggle={len(set(r['kaggle_dataset_name'] for r in picked))} "
               f"tiers={Counter(r['_features']['package_tier'] for r in picked)} "
               f"answers={Counter(r['_features']['answer_type'] for r in picked)}")
@@ -575,8 +578,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--source-split", default="non_thinking",
                    choices=["thinking", "non_thinking"])
-    p.add_argument("--n-per-bucket", type=int, default=50,
-                   help="Final picks per difficulty bucket (default 50 → 150 total).")
+    p.add_argument("--n-easy", type=int, default=50)
+    p.add_argument("--n-medium", type=int, default=25)
+    p.add_argument("--n-hard", type=int, default=25)
     p.add_argument("--max-per-kaggle", type=int, default=2)
     p.add_argument("--candidate-pool", type=int, default=1500,
                    help="Heuristic candidate pool size sent to the LLM.")
@@ -634,9 +638,10 @@ def main() -> int:
     score_dist = Counter(r["llm_score"] for r in candidates)
     print(f"[scores] {dict(sorted(score_dist.items()))}")
 
+    counts = {"easy": args.n_easy, "medium": args.n_medium, "hard": args.n_hard}
     chosen = stratified_sample(
         candidates,
-        n_per_bucket=args.n_per_bucket,
+        counts=counts,
         max_per_kaggle=args.max_per_kaggle,
         seed=args.seed,
     )
@@ -649,10 +654,11 @@ def main() -> int:
     # Summary
     print()
     print("─" * 60)
-    print(f"Total: {len(chosen)} tasks")
+    print(f"Total: {len(chosen)} tasks (target {sum(counts.values())})")
     for bucket in ("easy", "medium", "hard"):
         bucket_rows = [r for r in chosen if r["difficulty"] == bucket]
-        print(f"  {bucket:6s}: {len(bucket_rows)} "
+        target = counts[bucket]
+        print(f"  {bucket:6s}: {len(bucket_rows)}/{target} "
               f"unique_kaggle={len({r['kaggle_dataset_name'] for r in bucket_rows})}")
     print(f"\nNext: build the Harbor suite from these ids:")
     print(f"  uv run python -m prepare.build_harbor_tasks \\")
