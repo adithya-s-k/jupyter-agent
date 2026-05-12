@@ -1,4 +1,5 @@
-"""Harbor BaseAgent that exposes the 5 jupyter-style tools to an OpenAI model.
+"""Harbor BaseAgent that exposes 4 jupyter-style tools to ANY of 3 LLM
+providers (OpenAI, Anthropic, HF Inference Providers).
 
 This is the "structured-tool" alternative to Harbor's stock CLI agents
 (opencode/codex/etc.). Same task spec, same Harbor verifier — only the agent
@@ -9,17 +10,30 @@ gives the model:
   - edit_and_execute_current_cell(code)    — replace last cell, re-run
   - execute_shell_command(command)         — env.exec passthrough
   - get_notebook_state(include_images)     — in-agent tracker summary
-  - final_answer(answer)                   — writes /workdir/answer.txt + ends
+
+There is intentionally NO `final_answer` tool. The agent submits by writing
+its answer to `/workdir/answer.txt` (e.g. `Path("/workdir/answer.txt")
+.write_text(str(value))` in a code cell, or `echo … > /workdir/answer.txt` via
+shell). The loop ends when the model stops calling tools.
+
+This makes the task spec agent-agnostic: opencode (bash/edit/read), our
+jupyter-tool, codex, etc. all use the same file-based submission protocol.
 
 The kernel is a tiny HTTP server (`kernel_server.py`) we upload to /opt/ and
 start in the background. Each tool call → `env.exec(python /opt/run_cell.py …)`.
+
+Provider is detected from the `--model` prefix:
+  openai/gpt-5                                    → OpenAI native
+  anthropic/claude-sonnet-4-6                     → Anthropic native
+  hf/Qwen/Qwen3-235B-A22B-Instruct-2507:nscale    → HF Inference (OpenAI-compat
+                                                    router at router.huggingface.co/v1)
 
 Wire it into a Harbor run via:
   harbor run -p <task_dir> \
     --agent-import-path harbor_agents.jupyter:JupyterToolAgent \
     --model openai/gpt-5 \
     --ae OPENAI_API_KEY=... \
-    --env docker
+    --env e2b
 """
 
 from __future__ import annotations
@@ -108,21 +122,6 @@ TOOLS: list[dict] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "final_answer",
-            "description": (
-                "Submit your final answer. This ends the task. The Harbor "
-                "verifier grades it (case-insensitive / numeric / LLM-judge)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {"answer": {"type": "string"}},
-                "required": ["answer"],
-            },
-        },
-    },
 ]
 
 
@@ -175,10 +174,13 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_MAX_TURNS = 25
 SYSTEM_PROMPT = (
     "You are a Python data-analysis agent running in a stateful Jupyter-style "
-    "kernel. Use the provided tools to load files, run code, inspect state, "
-    "and submit your final answer via the `final_answer` tool. Variables and "
-    "imports persist across cells. Keep the answer short and concise; the "
-    "grader is a three-tier match (exact / numeric tolerance / LLM judge)."
+    "kernel. Use the provided tools to load files, run code, and inspect "
+    "state. Variables and imports persist across cells.\n\n"
+    "To submit your final answer: write it to /workdir/answer.txt using a "
+    "Python cell (e.g. `Path('/workdir/answer.txt').write_text(str(value))`) "
+    "or a shell command. Keep the answer short and concise — the grader is a "
+    "three-tier match (exact / numeric tolerance / LLM judge). Once the "
+    "answer file is written, stop calling tools."
 )
 
 
@@ -206,13 +208,24 @@ class JupyterToolAgent(BaseAgent):
     # ── Helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _model_id_for_openai(name: str | None) -> str:
-        """Accepts `openai/gpt-5`, `gpt-5`, etc. Returns the bare OpenAI id."""
+    def _parse_model(name: str | None) -> tuple[str, str]:
+        """Return (provider, bare_model_id).
+
+        openai/gpt-5                                  → ('openai', 'gpt-5')
+        anthropic/claude-sonnet-4-6                   → ('anthropic', 'claude-sonnet-4-6')
+        hf/Qwen/Qwen3-235B-A22B-Instruct-2507:nscale  → ('hf', 'Qwen/Qwen3-235B-A22B-Instruct-2507:nscale')
+        gpt-5  (no prefix)                            → ('openai', 'gpt-5')  (back-compat)
+        """
         if not name:
-            return "gpt-4o-mini"
-        if name.startswith("openai/"):
-            return name[len("openai/"):]
-        return name
+            return "openai", "gpt-4o-mini"
+        for prefix, provider in (
+            ("openai/", "openai"),
+            ("anthropic/", "anthropic"),
+            ("hf/", "hf"),
+        ):
+            if name.startswith(prefix):
+                return provider, name[len(prefix):]
+        return "openai", name
 
     async def _exec_cell(self, env: BaseEnvironment, code: str) -> tuple[str, bool]:
         """Send code to kernel_server and return (output, ok)."""
@@ -267,54 +280,63 @@ class JupyterToolAgent(BaseAgent):
 
     # ── Required: run ──────────────────────────────────────────────────────
 
-    async def run(
-        self,
-        instruction: str,
-        environment: BaseEnvironment,
-        context: AgentContext,
-    ) -> None:
-        """Drive the OpenAI tool-calling loop against the 5 jupyter tools."""
+    # ── Tool dispatch (provider-agnostic) ─────────────────────────────────
 
-        # Lazy imports so the module loads even when openai isn't around.
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("openai package required (uv pip install openai)") from exc
+    async def _dispatch_tool(
+        self, environment: BaseEnvironment, tracker: NotebookTracker,
+        name: str, args: dict,
+    ) -> str:
+        """Returns the tool's textual output (truncated to 8k chars)."""
+        if name == "add_and_execute_code_cell":
+            code = args.get("code", "")
+            output, ok = await self._exec_cell(environment, code)
+            tracker.add(Cell(kind="code", code=code, output=output, ok=ok))
+        elif name == "edit_and_execute_current_cell":
+            code = args.get("code", "")
+            output, ok = await self._exec_cell(environment, code)
+            tracker.replace_last(Cell(kind="code", code=code, output=output, ok=ok))
+        elif name == "execute_shell_command":
+            command = args.get("command", "")
+            r = await environment.exec(command, timeout_sec=120)
+            output = (r.stdout or "") + (r.stderr or "")
+            ok = r.return_code == 0
+            tracker.add(Cell(kind="shell", code=command, output=output, ok=ok))
+        elif name == "get_notebook_state":
+            output = tracker.summary()
+        else:
+            output = f"Unknown tool: {name}"
 
-        model_id = self._model_id_for_openai(self.model_name)
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY not set on the host")
-        client = OpenAI(api_key=api_key)
+        if len(output) > 8000:
+            output = output[:8000] + "\n... [truncated]"
+        return output
 
+    # ── Provider-specific loops ───────────────────────────────────────────
+
+    async def _run_openai_compat(
+        self, instruction: str, environment: BaseEnvironment,
+        model_id: str, api_key: str, base_url: str | None,
+    ) -> tuple[list[dict], NotebookTracker]:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
         tracker = NotebookTracker()
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
         ]
 
-        final_answer: str | None = None
-        t0 = time.time()
-
         for turn in range(self.max_turns):
             self.logger.info(f"[turn {turn}] requesting completion (model={model_id})")
             resp = client.chat.completions.create(
-                model=model_id,
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
+                model=model_id, messages=messages, tools=TOOLS, tool_choice="auto",
             )
             msg = resp.choices[0].message
             entry: dict = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
                 entry["tool_calls"] = [
                     {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
+                        "id": tc.id, "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     }
                     for tc in msg.tool_calls
                 ]
@@ -324,67 +346,69 @@ class JupyterToolAgent(BaseAgent):
                 self.logger.info(f"[turn {turn}] no tool calls — stopping")
                 break
 
-            done = False
             for tc in msg.tool_calls:
                 name = tc.function.name
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-
-                if name == "add_and_execute_code_cell":
-                    code = args.get("code", "")
-                    output, ok = await self._exec_cell(environment, code)
-                    tracker.add(Cell(kind="code", code=code, output=output, ok=ok))
-                elif name == "edit_and_execute_current_cell":
-                    code = args.get("code", "")
-                    output, ok = await self._exec_cell(environment, code)
-                    tracker.replace_last(Cell(kind="code", code=code, output=output, ok=ok))
-                elif name == "execute_shell_command":
-                    command = args.get("command", "")
-                    r = await environment.exec(command, timeout_sec=120)
-                    output = (r.stdout or "") + (r.stderr or "")
-                    ok = r.return_code == 0
-                    tracker.add(Cell(kind="shell", code=command, output=output, ok=ok))
-                elif name == "get_notebook_state":
-                    output = tracker.summary()
-                elif name == "final_answer":
-                    final_answer = (args.get("answer") or "").strip()
-                    # Write to the path Harbor's verifier reads.
-                    safe = shlex.quote(final_answer)
-                    await environment.exec(f"mkdir -p /workdir && printf %s {safe} > /workdir/answer.txt", timeout_sec=30)
-                    output = f"Answer submitted: {final_answer}"
-                    done = True
-                else:
-                    output = f"Unknown tool: {name}"
-
-                # Cap to keep token usage sane.
-                if len(output) > 8000:
-                    output = output[:8000] + f"\n... [truncated]"
+                output = await self._dispatch_tool(environment, tracker, name, args)
                 self.logger.info(f"[turn {turn}] tool={name} out_chars={len(output)}")
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+        return messages, tracker
 
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": output}
-                )
+    # Anthropic path now routes through the OpenAI-compatible endpoint at
+    # https://api.anthropic.com/v1/ so we don't need the `anthropic` SDK at
+    # all. See `_run_openai_compat`.
 
-            if done:
-                break
+    # ── Required: run (dispatches to provider-specific loop) ──────────────
 
-        # Log the trajectory for debugging — Harbor will surface this dir.
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        provider, model_id = self._parse_model(self.model_name)
+        t0 = time.time()
+
+        # All three providers go through the OpenAI client; only base_url + key
+        # differ. Anthropic exposes an OpenAI-compat shim at api.anthropic.com/v1,
+        # HF Inference exposes one at router.huggingface.co/v1.
+        if provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+            base_url = None
+        elif provider == "anthropic":
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            base_url = "https://api.anthropic.com/v1/"
+        elif provider == "hf":
+            api_key = os.environ.get("HF_TOKEN")
+            base_url = "https://router.huggingface.co/v1"
+        else:
+            raise RuntimeError(f"unknown provider in model={self.model_name!r}")
+
+        if not api_key:
+            raise RuntimeError(f"API key missing for provider={provider}")
+
+        messages, tracker = await self._run_openai_compat(
+            instruction, environment, model_id, api_key, base_url=base_url,
+        )
+
+        # Persist trajectory + tracker for debugging
         try:
             (self.logs_dir / "jupyter_agent.trajectory.json").write_text(
                 json.dumps(messages, default=str, indent=2)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         try:
             (self.logs_dir / "jupyter_agent.tracker.txt").write_text(
                 tracker.summary(max_cells=200)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
         self.logger.info(
-            f"jupyter-tool agent done: turns={len(messages)//2}  "
-            f"final_answer={final_answer!r}  elapsed={time.time()-t0:.1f}s"
+            f"jupyter-tool agent done: provider={provider} model={model_id}  "
+            f"elapsed={time.time()-t0:.1f}s"
         )

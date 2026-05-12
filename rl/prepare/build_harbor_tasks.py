@@ -221,10 +221,11 @@ def render_instruction(question: str, files_used: list[str], packages_used: list
     packages_str = ", ".join(packages_used) if packages_used else "(none)"
     body = template.format(files=files_str, packages=packages_str, question=question)
     footer = (
-        "\n\n---\nWhen you have the final answer, call the `final_answer` tool "
-        "with a short concise value, OR (Harbor CLI path) write it to "
-        "`/workdir/answer.txt`. The grader compares (case-insensitive, "
-        "numeric tolerance, LLM judge) to the gold answer."
+        "\n\n---\n**Submission:** write your final answer (a short, concise "
+        "value) to `/workdir/answer.txt`. The grader reads that file and "
+        "compares it to the gold answer (exact match / numeric tolerance / "
+        "LLM judge). Do not echo any other text into the file. After writing "
+        "the answer, stop calling tools."
     )
     return body + footer
 
@@ -405,19 +406,42 @@ def main() -> int:
     parser.add_argument("--user", default=DEFAULT_USER)
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument(
+        "--ids-from", type=Path, default=None,
+        help="Use exactly these source-row ids (one per line; e.g. cache/eval/eval_ids.txt). "
+             "Overrides random sampling. --n-tasks is ignored.",
+    )
+    parser.add_argument(
+        "--exclude-ids", type=Path, default=None,
+        help="Drop these source-row ids from the candidate pool (e.g. eval_ids.txt during train build).",
+    )
+    parser.add_argument(
+        "--data-bucket-id", default=None,
+        help="Override the per-suite data bucket (default <user>/<base>-data). "
+             "Use AdithyaSK/jupyter-agent-kaggle-all to reuse the already-uploaded all-datasets bucket.",
+    )
+    parser.add_argument(
+        "--skip-data-download", action="store_true",
+        help="Skip kagglehub download + local data mirror. Use when --data-bucket-id already has all needed data.",
+    )
     args = parser.parse_args()
 
     load_dotenv(REPO_ROOT / ".env")
 
     names = derive_names(args.name, user=args.user)
+    if args.data_bucket_id:
+        names["bucket_id"] = args.data_bucket_id  # override per-suite bucket
     out_dir = Path(names["local_dir"])
     data_dir = Path(names["local_data_dir"])
     print(f"[plan] --name={names['slug']}")
     print(f"  base name:    {names['base']}")
     print(f"  local dir:    {names['local_dir']}")
     print(f"  data dir:     {names['local_data_dir']}")
-    print(f"  bucket:       hf://buckets/{names['bucket_id']}")
+    print(f"  data bucket:  hf://buckets/{names['bucket_id']}"
+          f"{' (override)' if args.data_bucket_id else ''}")
     print(f"  hub repo:     hf://datasets/{names['repo_id']}")
+    if args.skip_data_download:
+        print(f"  skip kagglehub download (bucket is canonical)")
 
     if not GRADER_SRC.exists():
         print(f"[err] {GRADER_SRC} missing — write rl/grader.py first.")
@@ -451,13 +475,31 @@ def main() -> int:
             seen[key] = row
     rows = list(seen.values())
 
-    rng = random.Random(args.seed)
-    rng.shuffle(rows)
-    candidates = rows[: args.n_tasks * args.candidate_multiplier]
-    print(f"[candidates] {len(candidates)} (target N={args.n_tasks}, multiplier={args.candidate_multiplier})")
+    # Optional id-list filters (eval suite: --ids-from; train: --exclude-ids)
+    if args.exclude_ids:
+        bad = set(
+            line.strip() for line in args.exclude_ids.read_text().splitlines() if line.strip()
+        )
+        before = len(rows)
+        rows = [r for r in rows if r["id"] not in bad]
+        print(f"[exclude] dropped {before - len(rows)} ids listed in {args.exclude_ids}")
 
-    # ── Phase 1: parallel Kaggle download ───────────────────────────────────
-    setup_kaggle_auth()
+    if args.ids_from:
+        want = [line.strip() for line in args.ids_from.read_text().splitlines() if line.strip()]
+        want_set = set(want)
+        by_id = {r["id"]: r for r in rows if r["id"] in want_set}
+        missing = [i for i in want if i not in by_id]
+        if missing:
+            print(f"[warn] {len(missing)} ids from --ids-from not found in source (first 5: {missing[:5]})")
+        candidates = [by_id[i] for i in want if i in by_id]  # preserve eval order
+        print(f"[ids-from] using {len(candidates)} ids from {args.ids_from}")
+    else:
+        rng = random.Random(args.seed)
+        rng.shuffle(rows)
+        candidates = rows[: args.n_tasks * args.candidate_multiplier]
+        print(f"[candidates] {len(candidates)} (target N={args.n_tasks}, multiplier={args.candidate_multiplier})")
+
+    # ── Phase 1: parallel Kaggle download (skippable if data is already in bucket) ──
     unique_kaggles = []
     seen_set: set[str] = set()
     for r in candidates:
@@ -465,22 +507,41 @@ def main() -> int:
         if n not in seen_set:
             seen_set.add(n)
             unique_kaggles.append(n)
-    successes, failures = parallel_download(unique_kaggles, max_workers=args.max_workers)
 
-    # ── Phase 2: pick first N rows whose kaggle is downloaded ───────────────
-    accepted: list[tuple[dict, Path]] = []
-    for r in candidates:
-        kg = r["kaggle_dataset_name"]
-        if kg in successes:
-            accepted.append((r, successes[kg]))
-            if len(accepted) >= args.n_tasks:
-                break
+    if args.skip_data_download:
+        successes: dict[str, Path] = {kg: None for kg in unique_kaggles}  # type: ignore[dict-item]
+        failures: dict[str, str] = {}
+        print(f"[kaggle] skipped (using bucket {names['bucket_id']} as canonical store)")
+    else:
+        setup_kaggle_auth()
+        successes, failures = parallel_download(unique_kaggles, max_workers=args.max_workers)
 
-    if len(accepted) < args.n_tasks:
-        print(
-            f"[warn] only {len(accepted)} task(s) survived kaggle download; "
-            f"raise --candidate-multiplier (now {args.candidate_multiplier})."
-        )
+    # ── Phase 2: pick rows whose kaggle is available ────────────────────────
+    if args.ids_from:
+        # Use ALL ids-from rows that have data available; warn on any drops.
+        accepted = []
+        skipped_no_data: list[str] = []
+        for r in candidates:
+            kg = r["kaggle_dataset_name"]
+            if kg in successes:
+                accepted.append((r, successes[kg]))
+            else:
+                skipped_no_data.append(r["id"])
+        if skipped_no_data:
+            print(f"[warn] {len(skipped_no_data)} ids dropped (kaggle not available): {skipped_no_data[:3]}…")
+    else:
+        accepted = []
+        for r in candidates:
+            kg = r["kaggle_dataset_name"]
+            if kg in successes:
+                accepted.append((r, successes[kg]))
+                if len(accepted) >= args.n_tasks:
+                    break
+        if len(accepted) < args.n_tasks:
+            print(
+                f"[warn] only {len(accepted)} task(s) survived kaggle download; "
+                f"raise --candidate-multiplier (now {args.candidate_multiplier})."
+            )
 
     if not accepted:
         print("[err] no successful tasks. exiting.", file=sys.stderr)
@@ -506,8 +567,9 @@ def main() -> int:
         question = (row.get("question") or "").strip()
 
         # Mirror data once per unique dataset into the shared data/<prefix>/.
+        # Skipped when --skip-data-download (bucket is canonical).
         dataset_dest = data_dir / prefix
-        if prefix not in mirrored_prefixes:
+        if not args.skip_data_download and prefix not in mirrored_prefixes:
             n_mirrored = mirror_into_data_dir(kaggle_local, dataset_dest)
             mirrored_prefixes.add(prefix)
             print(f"  [mirror] {prefix}: {n_mirrored} file(s) → {dataset_dest}")
