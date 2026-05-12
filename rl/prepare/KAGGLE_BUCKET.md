@@ -36,19 +36,29 @@ The exclusion list lives in the bucket so every machine that builds a train suit
 | File | Contents | Size |
 |---|---|---|
 | `eval_v1/eval_ids.txt` | 100 source-row ids, one per line. The canonical exclusion list. | 2.9 KB |
-| `eval_v1/eval_manifest.parquet` | Full per-row metadata: `id, question, answer, kaggle_dataset_name, difficulty, llm_score, feat_*`. Use for audit / inspection. | 35 KB |
-| `eval_v1/candidates.parquet` | All 2,000 LLM-scored candidates the eval was sampled from. Useful if you want to expand the eval or use a different stratification. | 345 KB |
+| `eval_v1/eval_manifest.parquet` | Full per-row metadata: `id, question, answer, kaggle_dataset_name, difficulty, llm_score, audit_verdict, audit_reasoning, feat_*`. The `audit_verdict` column is the 3-vote majority verdict from `prepare/llm_audit.py`. | 48 KB |
+| `eval_v1/llm_audit.parquet` | Just the audit columns (`id, question, answer, difficulty, audit_verdict, audit_reasoning, audit_votes`) — joinable by `id`. | 49 KB |
+| `eval_v1/candidates_audited.parquet` | All 2,000 LLM-scored candidates **with 3-vote majority audit verdicts**. 1,075 CLEAN. Use as the supply pool for any eval refresh or train build. | 554 KB |
 
 ### Composition (as of 2026-05-13)
 
-| Bucket | Count | Unique Kaggle datasets | LLM score range |
+| Bucket | Count | Unique Kaggle datasets | LLM-CLEAN (3-vote majority) |
 |---|---|---|---|
-| easy   | 50 | 47 | 1–2 |
-| medium | 25 | 24 | 3 |
-| hard   | 25 | 23 | 4–5 |
-| **Total** | **100** | **94** | 1–5 |
+| easy   | 50 | ~46 | **50 / 50** |
+| medium | 25 | ~22 | **24 / 25** |
+| hard   | 25 | ~24 | **9 / 25** |
+| **Total** | **100** | **~88** | **83 / 100** |
 
 Within each bucket: tiers ~⅓ each (basic pandas / +viz / +ML), answer types ~½ numeric / ½ string, max 2 tasks per Kaggle dataset.
+
+### Audit methodology
+
+The eval set was refined over several rounds, ending with a **3-vote majority LLM audit** (`prepare/llm_audit.py --votes 3`) — `gpt-4o-mini` judges each `(question, gold_answer)` three times with the rubric *"can the agent reproduce this from the dataset alone, or does it depend on the original notebook's choices?"* Verdicts:
+- **CLEAN** — reproducible from the dataset + question.
+- **DEPENDENT** — needs the original notebook's specific choices (which model, which split, which features, which seed, …).
+- **IMPOSSIBLE** — sentence-shaped, ambiguous, or non-English without clear English equivalence.
+
+The remaining 17 non-CLEAN tasks are concentrated in **hard** and reflect a genuine ceiling — many genuinely-hard data-analysis questions in the source dataset are notebook-coupled by nature. They are still gradeable via the upgraded LLM-judge prompt in `rl/grader.py` (which has explicit rules for parenthetical / percent / multi-part answers). Don't expect >40% pass-rate on hard from a frontier model.
 
 ### Use it: drop eval ids from a train build
 
@@ -70,7 +80,9 @@ uv run python -m prepare.build_harbor_tasks \
     --skip-data-download
 ```
 
-`build_harbor_tasks.py`'s `--exclude-ids` filters the dedup pool by `id` (row-level), so the exact eval `(kaggle, question)` rows are never seen during training. Other rows from the same Kaggle datasets are kept — the agent can train on `mmoreaux/audio-cats-and-dogs` with all questions *except* `…_qa_5` (which is in eval).
+`build_harbor_tasks.py`'s `--exclude-ids` filters the dedup pool by `id` (row-level), so the exact eval `(kaggle, question)` rows are never seen during training. Other rows from the same Kaggle datasets are kept — the agent can train on `mmoreaux/audio-cats-and-dogs` with all questions *except* the one(s) in eval.
+
+For an audited train build, also drop everything LLM-DEPENDENT from the candidate pool — use `_meta/eval_v1/candidates_audited.parquet` and filter `audit_verdict == "CLEAN"` before sampling.
 
 ### Quick check: how often does the same Kaggle dataset show up in both?
 
