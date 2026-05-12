@@ -27,14 +27,22 @@ class JudgeVerdict(str, Enum):
 
 
 class JudgeOut(BaseModel):
+    # Field order matters: with structured output, the model fills fields in
+    # declaration order. Putting `reasoning` first forces chain-of-thought
+    # before committing to a verdict — Evidently / Databricks / Patronus all
+    # report 10–15% better judge–human agreement when reasoning precedes label.
+    reasoning: str = Field(
+        description=(
+            "One short sentence walking through: (a) what core value the gold "
+            "expresses, (b) whether the prediction's core value matches it."
+        ),
+        default="",
+    )
     verdict: JudgeVerdict = Field(
         description=(
             "CORRECT if the predicted answer is semantically equivalent to the gold; "
             "INCORRECT if it commits to a different value; NOT_ATTEMPTED if it hedges."
         )
-    )
-    reasoning: str = Field(
-        description="One sentence explaining the verdict.", default=""
     )
 
 
@@ -48,6 +56,17 @@ Rules:
 - Extra surrounding prose is fine if the gold value is clearly stated
   (gold "5", predicted "There are 5 distinct categories" -> CORRECT).
 - Common synonyms/abbreviations count (gold "Not Applicable", predicted "N/A" -> CORRECT).
+- **Parenthetical annotations in the gold are equivalence hints, not required.**
+  (gold "Gandalf (Ainur)", predicted "Gandalf" -> CORRECT;
+   gold "No (correlation coefficient = 0.02)", predicted "No" -> CORRECT).
+- **Percent + qualifier**: if the gold is "X% in YEAR", a prediction of X or X%
+  is CORRECT as long as the core numeric value matches
+  (gold "21.334% in 2014", predicted "21.334" -> CORRECT;
+   gold "21.334% in 2014", predicted "21.334% in 2013" -> INCORRECT — year mismatch).
+- **Multi-part gold**: if the gold lists two values joined by "and" but the
+  question only asks for one (e.g. "which model wins?" → gold "0.987 (XGBoost and LGBM)"),
+  predicting either model name is CORRECT. If the question explicitly asks for
+  both halves, predicting only one is INCORRECT.
 - If the predicted answer hedges without committing to the gold value -> NOT_ATTEMPTED.
 - If it commits to a different value -> INCORRECT.
 

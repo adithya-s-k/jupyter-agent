@@ -40,6 +40,15 @@ Rules:
 - Extra surrounding prose is fine if the gold value is clearly stated
   (gold "5", predicted "There are 5 distinct categories" -> CORRECT).
 - Common synonyms/abbreviations count (gold "Not Applicable", predicted "N/A" -> CORRECT).
+- Parenthetical annotations in the gold are equivalence hints, not required
+  (gold "Gandalf (Ainur)", predicted "Gandalf" -> CORRECT;
+   gold "No (correlation coefficient = 0.02)", predicted "No" -> CORRECT).
+- Percent + qualifier: if the gold is "X% in YEAR", a prediction of X or X%
+  is CORRECT as long as the core numeric value matches
+  (gold "21.334% in 2014", predicted "21.334" -> CORRECT;
+   gold "21.334% in 2014", predicted "21.334% in 2013" -> INCORRECT — year mismatch).
+- Multi-part gold like "0.987 (XGBoost and LGBM)" — if the question asks for one
+  thing (e.g. "which model?"), predicting either listed value is CORRECT.
 - If the predicted answer hedges without committing to the gold value -> NOT_ATTEMPTED.
 - If it commits to a different value -> INCORRECT.
 
