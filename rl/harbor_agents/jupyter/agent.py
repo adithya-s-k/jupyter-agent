@@ -52,7 +52,7 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from .._shared import parse_model, provider_credentials
+from .._shared import parse_model, provider_credentials, UsageTracker
 
 
 # ---------------------------------------------------------------------------
@@ -297,11 +297,12 @@ class JupyterToolAgent(BaseAgent):
     async def _run_openai_compat(
         self, instruction: str, environment: BaseEnvironment,
         model_id: str, api_key: str, base_url: str | None,
-    ) -> tuple[list[dict], NotebookTracker]:
+    ) -> tuple[list[dict], NotebookTracker, UsageTracker]:
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
-        tracker = NotebookTracker()
+        nb_tracker = NotebookTracker()
+        usage = UsageTracker(model_name=self.model_name)
         messages: list[dict] = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
@@ -312,6 +313,7 @@ class JupyterToolAgent(BaseAgent):
             resp = client.chat.completions.create(
                 model=model_id, messages=messages, tools=TOOLS, tool_choice="auto",
             )
+            usage.add_response(resp)
             msg = resp.choices[0].message
             entry: dict = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
@@ -334,10 +336,10 @@ class JupyterToolAgent(BaseAgent):
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                output = await self._dispatch_tool(environment, tracker, name, args)
+                output = await self._dispatch_tool(environment, nb_tracker, name, args)
                 self.logger.info(f"[turn {turn}] tool={name} out_chars={len(output)}")
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-        return messages, tracker
+        return messages, nb_tracker, usage
 
     # Anthropic path now routes through the OpenAI-compatible endpoint at
     # https://api.anthropic.com/v1/ so we don't need the `anthropic` SDK at
@@ -357,25 +359,28 @@ class JupyterToolAgent(BaseAgent):
             raise RuntimeError(f"API key missing for provider={provider}")
         t0 = time.time()
 
-        messages, tracker = await self._run_openai_compat(
+        messages, nb_tracker, usage = await self._run_openai_compat(
             instruction, environment, model_id, api_key, base_url=base_url,
         )
+
+        usage.populate(context)
 
         # Persist trajectory + tracker for debugging
         try:
             (self.logs_dir / "jupyter_agent.trajectory.json").write_text(
                 json.dumps(messages, default=str, indent=2)
             )
-        except Exception:  # noqa: BLE001
-            pass
-        try:
             (self.logs_dir / "jupyter_agent.tracker.txt").write_text(
-                tracker.summary(max_cells=200)
+                nb_tracker.summary(max_cells=200)
+            )
+            (self.logs_dir / "jupyter_agent.usage.json").write_text(
+                json.dumps(usage.as_dict(), indent=2)
             )
         except Exception:  # noqa: BLE001
             pass
 
         self.logger.info(
             f"jupyter-tool agent done: provider={provider} model={model_id}  "
-            f"elapsed={time.time()-t0:.1f}s"
+            f"calls={usage.n_calls}  tokens={usage.prompt_tokens}+{usage.completion_tokens}  "
+            f"cost_usd={usage.cost_usd:.6f}  elapsed={time.time()-t0:.1f}s"
         )

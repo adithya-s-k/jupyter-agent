@@ -53,7 +53,7 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from .._shared import parse_model, provider_credentials
+from .._shared import parse_model, provider_credentials, UsageTracker
 
 
 # ---------------------------------------------------------------------------
@@ -419,10 +419,11 @@ class SetaToolAgent(BaseAgent):
     async def _run_loop(
         self, instruction: str, environment: BaseEnvironment,
         model_id: str, api_key: str, base_url: str | None,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], UsageTracker]:
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+        usage = UsageTracker(model_name=self.model_name)
         messages: list[dict] = [
             {"role": "system", "content": self._make_system_prompt()},
             {"role": "user", "content": instruction},
@@ -436,6 +437,7 @@ class SetaToolAgent(BaseAgent):
             resp = client.chat.completions.create(
                 model=model_id, messages=messages, tools=TOOLS, tool_choice="auto",
             )
+            usage.add_response(resp)
             msg = resp.choices[0].message
             entry: dict = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
@@ -461,7 +463,7 @@ class SetaToolAgent(BaseAgent):
                 output = await self._dispatch_tool(environment, name, args)
                 self.logger.info(f"[turn {turn}] tool={name} out_chars={len(output)}")
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
-        return messages
+        return messages, usage
 
     # ── Required Harbor entry point ───────────────────────────────────────
 
@@ -474,24 +476,28 @@ class SetaToolAgent(BaseAgent):
             raise RuntimeError(f"API key missing for provider={provider}")
 
         t0 = time.time()
-        messages = await self._run_loop(instruction, environment, model_id, api_key, base_url)
+        messages, usage = await self._run_loop(instruction, environment, model_id, api_key, base_url)
         elapsed = time.time() - t0
 
-        # Persist trajectory + notes for debugging.
+        usage.populate(context)
+
+        # Persist trajectory + notes + usage for debugging.
         try:
             (self.logs_dir / "seta_agent.trajectory.json").write_text(
                 json.dumps(messages, default=str, indent=2)
             )
-        except Exception:  # noqa: BLE001
-            pass
-        try:
             (self.logs_dir / "seta_agent.notes.json").write_text(
                 json.dumps(self._notes, indent=2)
+            )
+            (self.logs_dir / "seta_agent.usage.json").write_text(
+                json.dumps(usage.as_dict(), indent=2)
             )
         except Exception:  # noqa: BLE001
             pass
 
         self.logger.info(
             f"seta-tool agent done: provider={provider} model={model_id}  "
-            f"notes={len(self._notes)}  elapsed={elapsed:.1f}s"
+            f"notes={len(self._notes)}  calls={usage.n_calls}  "
+            f"tokens={usage.prompt_tokens}+{usage.completion_tokens}  "
+            f"cost_usd={usage.cost_usd:.6f}  elapsed={elapsed:.1f}s"
         )
