@@ -18,11 +18,13 @@ Use `preview_dataset` to look at the files. If the necessary column doesn't exis
 
 ## 3. Is the gold simply wrong?
 
-Use `probe_with_model` — start with `gpt-5.5`. If GPT-5.5 also disagrees with the gold AND agrees with what Sonnet predicted, run another probe with `opus` to be sure. If the failing trajectory shows heavy code/debug (more than 15 turns of executing, debugging, retrying), use `gpt-5.5-codex` instead of `opus`.
+**Always start with `probe_with_model("nano")`** (gpt-5.4-nano). It's ~25× cheaper than the frontier probes and is plenty capable for most data-analysis questions. Most gold-correction decisions can be made on the basis of one nano probe alone.
 
-Rule: if ≥2 probe models converge on the same alternative answer that differs from the gold AND that answer is reproducibly derivable from the dataset, call `edit_task_toml("EXPECTED_ANSWER", "<consensus_answer>")` and `finalize(verdict="gold_corrected", reasoning="...")`.
+Decision flow after the first nano probe:
 
-If ≥2 probe models PASS with the existing gold (i.e., Sonnet was just flaky), call `finalize(verdict="verifiable_judge", reasoning="...")` — we trust the cross-model consensus.
+- **Nano's answer ≈ Sonnet's predicted (both disagree with the gold)** → strong signal the gold is wrong. Call `edit_task_toml("EXPECTED_ANSWER", "<consensus_answer>")` and `finalize(verdict="gold_corrected", ...)`. No second probe.
+- **Nano PASSES with the existing gold** (i.e., Sonnet was just flaky) → `finalize(verdict="verifiable_judge", ...)`. No second probe.
+- **Nano gives something different from BOTH Sonnet AND the gold** → genuine ambiguity. *Only here* do you escalate to a frontier probe (expensive, last resort).
 
 ## 4. Is the question ambiguous?
 
@@ -36,12 +38,9 @@ If the failing trajectories interpret the question in plausibly different ways, 
 
 If the kaggle bucket files don't contain the columns / structure the question requires (e.g., question asks about column X but no file has it), this is `dataset_mismatch`. Drop with `finalize(verdict="unverifiable", reasoning="dataset_mismatch: <why>")`.
 
-# Escalation policy for `probe_with_model`
-
-- **Default**: `gpt-5.5` — one cross-vendor model is usually enough.
-- **If `gpt-5.5` still disagrees with gold but you're unsure**: try `opus` as a tiebreaker.
-- **If the failure looks code-heavy** (long failing trajectory, lots of debugging, library issues): try `gpt-5.5-codex` instead of `opus`.
-- **Never probe with `sonnet`** — we already know it failed.
+<!-- PROBE_POLICY -->
+(probe model list + escalation policy will be appended here at runtime, based on
+which probe aliases are enabled for this run.)
 
 # Budget
 

@@ -60,9 +60,15 @@ class StateStore:
     _decisions: dict[str, dict] = field(default_factory=dict)
     # Cross-run "already terminal" set rebuilt at startup from prior runs.
     _terminal_from_prior: set[str] = field(default_factory=set)
+    # Rollup debounce: rebuild cross-run decisions.csv only every N flushes
+    # OR when force_rollup=True is passed (final flush at end of run).
+    _flushes_since_rollup: int = 0
+    rollup_every: int = 10        # rebuild rollup every N task flushes
 
     def __post_init__(self) -> None:
-        self.state_dir = Path(self.state_dir)
+        # Resolve to absolute so subprocesses (Harbor) inherit a path that
+        # doesn't depend on their cwd.
+        self.state_dir = Path(self.state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(exist_ok=True)
         # This run's home
@@ -124,11 +130,16 @@ class StateStore:
         df = df.sort_values("task_id").reset_index(drop=True)
         df.to_csv(self.run_dir / "decisions.csv", index=False)
 
-    def flush(self) -> None:
-        """Write this run's decisions.csv + rebuild the cross-run rollup."""
+    def flush(self, *, force_rollup: bool = False) -> None:
+        """Write this run's decisions.csv. Rebuild cross-run rollup only every
+        `rollup_every` calls (or when force_rollup=True).
+        """
         with self._lock:
             self._flush_run_decisions()
-            self._rebuild_rollup()
+            self._flushes_since_rollup += 1
+            if force_rollup or self._flushes_since_rollup >= self.rollup_every:
+                self._rebuild_rollup()
+                self._flushes_since_rollup = 0
 
     # ----- cross-run rollup at top level -----
 

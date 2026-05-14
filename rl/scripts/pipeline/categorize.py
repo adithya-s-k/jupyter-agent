@@ -162,7 +162,7 @@ def empirical_probe(*, row: Mapping, suite_path: Path, jobs_dir: Path,
     from .build import id_safe
 
     task_id = str(row["id"])
-    slug = EMPIRICAL_PROBE_MODEL.replace("/", "-").replace(".", "-")
+    slug = EMPIRICAL_PROBE_MODEL.replace("/", "-").replace(".", "-").replace(":", "-")
     job_name = f"empirical-{id_safe(task_id)}-{slug}"
     state.append_event(event="empirical_start", task_id=task_id, phase="D",
                        model=EMPIRICAL_PROBE_MODEL, job_name=job_name)
@@ -191,8 +191,10 @@ def empirical_probe(*, row: Mapping, suite_path: Path, jobs_dir: Path,
 
 def categorize(*, row: Mapping, passing_trial_dir: Path,
                suite_path: Path | None = None, jobs_dir: Path | None = None,
-               state=None, run_empirical: bool = False) -> CategorizeResult:
-    result = categorize_rubric(row=row, passing_trial_dir=passing_trial_dir, state=state)
+               state=None, run_empirical: bool = False,
+               model: str = CATEGORIZE_MODEL) -> CategorizeResult:
+    result = categorize_rubric(row=row, passing_trial_dir=passing_trial_dir,
+                               state=state, model=model)
 
     if run_empirical and suite_path and jobs_dir and state is not None:
         probe = empirical_probe(row=row, suite_path=suite_path,

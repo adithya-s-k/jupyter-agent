@@ -16,6 +16,10 @@ prices:
   "gpt-5":                {input:  1.25, output: 10.00, cached: 0.125}
   "gpt-4o":               {input:  2.50, output: 10.00, cached: 1.25}
   "gpt-4o-mini":          {input:  0.15, output:  0.60, cached: 0.075}
+  # GPT-5.4-Nano: latest cheap tier (May 2026). Used as the doctor's
+  # cheap-first probe model — see scripts/pipeline/doctor.py.
+  "gpt-5.4-nano":         {input:  0.20, output:  1.25, cached: 0.05}
+  "gpt-5-mini":           {input:  0.25, output:  2.00, cached: 0.025}
 
   # ── Anthropic (via api.anthropic.com/v1 OpenAI-compat shim) ─────────────
   # Sonnet 4.6 + Opus 4.7 confirmed from platform.claude.com/docs/en/about-claude/pricing.
@@ -35,3 +39,12 @@ prices:
   "Qwen/Qwen3-Coder-30B-A3B-Instruct":   {input: 0.10, output: 0.30}   # MoE 3B active
   "Qwen/Qwen3-235B-A22B-Instruct-2507":  {input: 0.80, output: 2.40}
   "Qwen/Qwen3-235B-A22B":                {input: 0.80, output: 2.40}
+
+  # ── Open-weight LLMs via HF Inference Providers (Novita) ─────────────────
+  # Pricing per HF Inference router as of 2026-05-15. Provider suffix is
+  # stripped in canonical_model_key before lookup.
+  "moonshotai/Kimi-K2-Instruct-0905":    {input: 0.55, output: 2.20}
+  "moonshotai/Kimi-K2":                  {input: 0.55, output: 2.20}
+  "zai-org/GLM-4.6":                     {input: 0.45, output: 1.90}
+  "deepseek-ai/DeepSeek-V3.1":           {input: 0.27, output: 1.10}
+  "deepseek-ai/DeepSeek-V3":             {input: 0.27, output: 1.10}

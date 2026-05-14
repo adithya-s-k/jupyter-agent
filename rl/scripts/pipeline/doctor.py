@@ -32,10 +32,62 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "doctor_system.md"
 DOCTOR_SYSTEM_PROMPT = _PROMPT_PATH.read_text()
 
 ALLOWED_PROBE_MODELS = {
-    "gpt-5.5":       "openai/gpt-5.5",
+    # ── Closed-source ────────────────────────────────────────────────
+    # Cheap-first. 25x cheaper than gpt-5.5; >90% of doctor sessions
+    # only need one nano probe to confirm/deny the gold.
+    "nano":          "openai/gpt-5.4-nano",
+    # Last-resort frontier — only when nano disagrees with the gold AND
+    # the doctor needs a stronger second opinion.
     "opus":          "anthropic/claude-opus-4-7",
+    "gpt-5.5":       "openai/gpt-5.5",
     "gpt-5.5-codex": "openai/gpt-5.5-codex",
+
+    # ── Open-source via HF Inference Providers ──────────────────────
+    # Both cheap-first AND generalist (Qwen3-8B doesn't tool-call reliably,
+    # so we use 235B for both tiers — still 4x cheaper than Sonnet).
+    "qwen":          "hf/Qwen/Qwen3-235B-A22B-Instruct-2507:nscale",
+    # Generalist last-resort (replacement for `opus`)
+    "glm":           "hf/zai-org/GLM-4.6:novita",
+    # Cross-vendor agentic (replacement for `gpt-5.5`)
+    "kimi":          "hf/moonshotai/Kimi-K2-Instruct-0905:novita",
+    # Code-heavy last-resort (replacement for `gpt-5.5-codex`)
+    "deepseek":      "hf/deepseek-ai/DeepSeek-V3.1:novita",
 }
+
+# Curated preset for the all-OSS path (used by --all-oss in CLI).
+OSS_PROBE_ALIASES = ("qwen", "glm", "kimi", "deepseek")
+CLOSED_PROBE_ALIASES = ("nano", "opus", "gpt-5.5", "gpt-5.5-codex")
+
+# Hard upper bound on probes per doctor session (each probe spins up a
+# fresh E2B sandbox; tail latency dominated by these).
+MAX_PROBES_PER_DOCTOR = 2
+
+
+def _render_probe_policy(aliases: list[str]) -> str:
+    """Render the 'Escalation policy' block for the doctor system prompt
+    based on which probe aliases are enabled.
+    """
+    lines = ["# Escalation policy for `probe_with_model`", ""]
+    # First probe = the first one in the list. Closed: nano, OSS: qwen.
+    if not aliases:
+        return "\n".join(lines + ["(no probe models are available; you must finalize without probing)"])
+    first = aliases[0]
+    rest = aliases[1:]
+    lines.append(
+        f"- **First probe (always)**: `{first}`. Cheap, sufficient for most "
+        "data-analysis disagreements."
+    )
+    if rest:
+        lines.append("- **Second probe (LAST RESORT)** — only fire when the first probe's answer differs from BOTH Sonnet AND the gold (three-way disagreement). Pick one of:")
+        for alias in rest:
+            lines.append(f"  - `{alias}`")
+    lines += [
+        f"- **Hard rule**: at most {MAX_PROBES_PER_DOCTOR} probes total per task "
+        "(enforced by the tool — further calls error out). If still no consensus, "
+        '`finalize(verdict="unverifiable", reasoning="model_disagreement: ...")`.',
+        "- **Never re-probe with the same model as Phase B's anchor** — we already know it failed.",
+    ]
+    return "\n".join(lines)
 
 ALLOWED_TOML_FIELDS = {
     "REWARD_MODE", "EXPECTED_ANSWER", "ATOL", "RTOL", "ANSWER_TYPE",
@@ -240,7 +292,8 @@ def build_dossier(row: Mapping, spec_dir: Path, trial_dirs: list[Path]) -> str:
 class DoctorCtx:
     """All the runtime state a tool dispatcher might need."""
     def __init__(self, *, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
-                 specs_archive_dir: Path, state, jobs_dir: Path):
+                 specs_archive_dir: Path, state, jobs_dir: Path,
+                 sandbox: str = "docker", subprocess_timeout_sec: int = 900):
         self.row = row
         self.spec_dir = spec_dir
         self.trial_dirs = trial_dirs        # paths to Phase B trial dirs by k_idx (0-2)
@@ -248,6 +301,8 @@ class DoctorCtx:
         self.specs_archive_dir = specs_archive_dir
         self.state = state
         self.jobs_dir = jobs_dir
+        self.sandbox = sandbox
+        self.subprocess_timeout_sec = subprocess_timeout_sec
         self.bucket_files: list[str] | None = None
         self.v0_snapshotted = False
 
@@ -346,22 +401,31 @@ def _dispatch_tool(name: str, args: dict, ctx: DoctorCtx) -> tuple[str, dict]:
 
     if name == "probe_with_model":
         m = args["model"]
-        if m not in ALLOWED_PROBE_MODELS:
-            return f"ERROR: model {m} not allowed.", side
-        full_model = ALLOWED_PROBE_MODELS[m]
+        active = getattr(ctx, "active_probes", ALLOWED_PROBE_MODELS)
+        if m not in active:
+            return (f"ERROR: probe alias '{m}' not enabled for this task. "
+                    f"Allowed: {list(active.keys())}"), side
+        if len(ctx.probe_trial_dirs) >= MAX_PROBES_PER_DOCTOR:
+            return (f"ERROR: probe limit reached ({MAX_PROBES_PER_DOCTOR} per task). "
+                    f"Make a decision based on what you have and call finalize."), side
+        full_model = active[m]
         suite_name = ctx.spec_dir.parent.name
         suite_path = ctx.spec_dir.parent
         task_id = ctx.row["id"]
         probe_idx = len(ctx.probe_trial_dirs)
-        slug = full_model.replace("/", "-").replace(".", "-")
+        slug = full_model.replace("/", "-").replace(".", "-").replace(":", "-")
         job_name = f"doctor-probe-{id_safe(task_id)}-{slug}-{probe_idx}"
         ctx.state.append_event(event="probe_start", task_id=task_id, phase="C",
                                model=full_model, job_name=job_name)
         t0 = time.time()
+        budget_fn = getattr(ctx, "budget_remaining_fn", None)
         result: TrialResult = run_trial(
             suite_path=suite_path, task_id=task_id, model=full_model,
             job_name=job_name, jobs_dir=ctx.jobs_dir,
-            sandbox="docker", log_dir=ctx.state.logs_dir,
+            sandbox=getattr(ctx, "sandbox", "docker"),
+            log_dir=ctx.state.logs_dir,
+            subprocess_timeout_sec=getattr(ctx, "subprocess_timeout_sec", 900),
+            budget_remaining_sec=budget_fn() if budget_fn else None,
         )
         ctx.probe_trial_dirs.append(result.trial_dir)
         ctx.state.append_event(
@@ -450,18 +514,55 @@ def run_doctor(*, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
                max_calls: int = 20,
                max_budget: float = 0.50,
                temperature: float = 0.0,
-               model: str = DOCTOR_MODEL) -> DoctorResult:
+               model: str = DOCTOR_MODEL,
+               sandbox: str = "docker",
+               subprocess_timeout_sec: int = 900,
+               budget_remaining_fn=None,
+               probe_aliases: list[str] | None = None) -> DoctorResult:
     task_id = str(row["id"])
+    # Filter the probe set if user constrained it (e.g., all-OSS run).
+    if probe_aliases:
+        unknown = [a for a in probe_aliases if a not in ALLOWED_PROBE_MODELS]
+        if unknown:
+            raise ValueError(f"unknown probe aliases: {unknown}. "
+                             f"available: {list(ALLOWED_PROBE_MODELS)}")
+        active_probes = {a: ALLOWED_PROBE_MODELS[a] for a in probe_aliases}
+    else:
+        active_probes = dict(ALLOWED_PROBE_MODELS)
     ctx = DoctorCtx(row=row, spec_dir=spec_dir, trial_dirs=trial_dirs,
-                    specs_archive_dir=specs_archive_dir, state=state, jobs_dir=jobs_dir)
+                    specs_archive_dir=specs_archive_dir, state=state, jobs_dir=jobs_dir,
+                    sandbox=sandbox, subprocess_timeout_sec=subprocess_timeout_sec)
+    ctx.budget_remaining_fn = budget_remaining_fn
+    ctx.active_probes = active_probes
+
+    # Render the system prompt with the probe-policy block substituted in,
+    # and rebuild the TOOLS list so the probe_with_model enum reflects only
+    # the active aliases for this run.
+    policy_text = _render_probe_policy(list(active_probes.keys()))
+    system_prompt = DOCTOR_SYSTEM_PROMPT.replace("<!-- PROBE_POLICY -->", policy_text)
+
+    tools_for_run = []
+    for t in TOOLS:
+        if t.get("function", {}).get("name") == "probe_with_model":
+            t2 = json.loads(json.dumps(t))  # deep copy
+            t2["function"]["parameters"]["properties"]["model"]["enum"] = list(active_probes.keys())
+            t2["function"]["description"] = (
+                "Run ONE additional seta trial with a different model to gather an "
+                "alt-answer. Synchronous; takes 30-90s. Allowed aliases: "
+                + ", ".join(f"'{a}'" for a in active_probes)
+            )
+            tools_for_run.append(t2)
+        else:
+            tools_for_run.append(t)
 
     user_dossier = build_dossier(row, spec_dir, trial_dirs)
     messages: list[dict] = [
-        {"role": "system", "content": DOCTOR_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_dossier},
     ]
     state.append_event(event="doctor_start", task_id=task_id, phase="C",
-                       model=model, dossier_chars=len(user_dossier))
+                       model=model, dossier_chars=len(user_dossier),
+                       active_probes=list(active_probes.keys()))
 
     total_doctor_cost = 0.0
     total_probe_cost = 0.0
@@ -471,7 +572,7 @@ def run_doctor(*, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
     n_calls = 0
 
     for turn in range(max_calls + 4):  # extra slack for tool-result roundtrips
-        resp = llm_client.call(model=model, messages=messages, tools=TOOLS,
+        resp = llm_client.call(model=model, messages=messages, tools=tools_for_run,
                                temperature=temperature,
                                state=state, task_id=task_id,
                                phase="C", call_kind="doctor")

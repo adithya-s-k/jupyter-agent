@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -19,6 +20,41 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+
+# Patterns in Harbor stderr that indicate the failure is transient (worth retrying).
+TRANSIENT_PATTERNS = (
+    "SandboxException",
+    "TimeoutException",
+    "InternalServerError",
+    "RateLimitError",
+    "Connection error",
+    "Read timed out",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "504 Gateway Timeout",
+    "Temporary failure",
+)
+
+
+def _is_transient_failure(error_kind: str, stderr_path: Path | None) -> bool:
+    """Decide whether a failed run is retriable based on error_kind + stderr."""
+    if error_kind == "harbor_timeout":
+        return True
+    if error_kind != "harbor_error":
+        return False
+    if not stderr_path or not stderr_path.exists():
+        return False
+    # Cap stderr read to last 16KB — sufficient to see the failure tail
+    try:
+        with stderr_path.open() as f:
+            f.seek(0, 2)  # end
+            size = f.tell()
+            f.seek(max(0, size - 16384))
+            tail = f.read()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(p in tail for p in TRANSIENT_PATTERNS)
 
 
 # Where the agents live (still under the legacy `harbor_agents/` name —
@@ -67,6 +103,11 @@ def build_command(*, suite_path: Path, task_id: str, model: str,
                   job_name: str, jobs_dir: Path,
                   sandbox: str = "docker",
                   keys: dict[str, str] | None = None) -> list[str]:
+    """Construct the `harbor run` command.
+
+    `suite_path` is the parent directory holding the task's spec dir — for
+    the bucketed layout this is `<suite>/<bucket>/`, not `<suite>/`.
+    """
     keys = keys or _read_env_keys()
     cmd = [
         "harbor", "run",
@@ -177,32 +218,29 @@ def parse_trial(job_dir: Path) -> dict:
     return out
 
 
-def run_trial(*, suite_path: Path, task_id: str, model: str,
-              job_name: str, jobs_dir: Path,
-              sandbox: str = "docker",
-              log_dir: Path | None = None) -> TrialResult:
-    """Invoke harbor and parse the result. Returns a TrialResult."""
+def _invoke_harbor_once(*, suite_path: Path, task_id: str, model: str,
+                        job_name: str, jobs_dir: Path,
+                        sandbox: str, log_dir: Path,
+                        subprocess_timeout_sec: int) -> tuple[dict, float, Path, Path]:
+    """One harbor invocation. Returns (parsed_dict, elapsed, stdout_path, stderr_path)."""
     cmd = build_command(
         suite_path=suite_path, task_id=task_id, model=model,
         job_name=job_name, jobs_dir=jobs_dir, sandbox=sandbox,
     )
-    log_dir = log_dir or jobs_dir / "_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{job_name}.stdout.log"
     stderr_path = log_dir / f"{job_name}.stderr.log"
-
     t0 = time.time()
     try:
         with stdout_path.open("w") as so, stderr_path.open("w") as se:
-            # Write the exact reproducible command at the top of stdout
             so.write("# CMD: " + " ".join(shlex.quote(p) for p in cmd) + "\n")
             so.flush()
             proc = subprocess.run(cmd, stdout=so, stderr=se,
-                                  timeout=1800, check=False, cwd=REPO_ROOT)
+                                  timeout=subprocess_timeout_sec,
+                                  check=False, cwd=REPO_ROOT)
         elapsed = time.time() - t0
         job_dir = jobs_dir / job_name
         parsed = parse_trial(job_dir)
-        # If harbor exited non-zero and we have no trial dir, that's a harbor error
         if proc.returncode != 0 and parsed["trial_dir"] is None:
             parsed["error_kind"] = "harbor_error"
     except subprocess.TimeoutExpired:
@@ -210,6 +248,67 @@ def run_trial(*, suite_path: Path, task_id: str, model: str,
         parsed = {"reward": 0.0, "predicted_answer": "", "error_kind": "harbor_timeout",
                   "cost_usd": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
                   "cached_tokens": 0, "trial_dir": None}
+    return parsed, elapsed, stdout_path, stderr_path
+
+
+def run_trial(*, suite_path: Path, task_id: str, model: str,
+              job_name: str, jobs_dir: Path,
+              sandbox: str = "docker",
+              log_dir: Path | None = None,
+              subprocess_timeout_sec: int = 900,
+              max_retries: int = 1,
+              budget_remaining_sec: float | None = None) -> TrialResult:
+    """Invoke harbor and parse the result. Returns a TrialResult.
+
+    On transient errors (SandboxException, TimeoutException, 5xx, etc.), retries
+    up to `max_retries` times with exponential backoff (5s, 15s).
+
+    `budget_remaining_sec` (if provided) further tightens the per-call timeout:
+    we use min(subprocess_timeout_sec, budget_remaining_sec - 5) so a Harbor
+    call started near the end of a task's wall budget won't blow past it. If
+    the budget is already exhausted (<30s left), we short-circuit and return
+    a budget_exhausted result without invoking Harbor at all.
+    """
+    log_dir = log_dir or jobs_dir / "_logs"
+    total_elapsed = 0.0
+
+    # Budget-aware short-circuit: don't even start if budget is too thin.
+    if budget_remaining_sec is not None and budget_remaining_sec < 30:
+        return TrialResult(
+            job_name=job_name, trial_dir=None, reward=0.0,
+            predicted_answer="", elapsed_sec=0.0, error_kind="budget_exhausted",
+            cost_usd=0.0, prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+            stdout_path=Path("/dev/null"), stderr_path=Path("/dev/null"),
+        )
+
+    # Effective timeout = min(configured, remaining budget - 5s slack)
+    effective_timeout = subprocess_timeout_sec
+    if budget_remaining_sec is not None:
+        effective_timeout = max(30, min(subprocess_timeout_sec,
+                                         int(budget_remaining_sec - 5)))
+
+    for attempt in range(max_retries + 1):
+        attempt_job_name = job_name if attempt == 0 else f"{job_name}-retry{attempt}"
+        parsed, elapsed, stdout_path, stderr_path = _invoke_harbor_once(
+            suite_path=suite_path, task_id=task_id, model=model,
+            job_name=attempt_job_name, jobs_dir=jobs_dir,
+            sandbox=sandbox, log_dir=log_dir,
+            subprocess_timeout_sec=effective_timeout,
+        )
+        total_elapsed += elapsed
+
+        # Success OR non-retriable failure — stop here
+        if parsed["error_kind"] not in ("harbor_error", "harbor_timeout"):
+            break
+        if attempt >= max_retries:
+            break
+        if not _is_transient_failure(parsed["error_kind"], stderr_path):
+            break
+        # Transient — backoff then retry
+        backoff = 5 * (2 ** attempt) + random.uniform(0, 3)
+        time.sleep(backoff)
+
+    elapsed = total_elapsed
 
     return TrialResult(
         job_name=job_name,

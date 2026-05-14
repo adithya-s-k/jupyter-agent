@@ -181,16 +181,39 @@ def _normalize_for_anthropic(m: Mapping[str, Any]) -> dict:
 # OpenAI native path (also handles anything else not Anthropic)
 # ---------------------------------------------------------------------------
 
-def _call_openai(*, model_id: str, messages, tools, temperature, max_tokens, response_format):
+def _call_openai(*, provider: str, model_id: str, messages, tools, temperature,
+                 max_tokens, response_format):
+    """OpenAI-compatible call. `provider` selects the API endpoint:
+       - "openai" → api.openai.com with OPENAI_API_KEY
+       - "hf"     → router.huggingface.co/v1 with HF_TOKEN
+    """
     from openai import OpenAI
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    kwargs: dict = dict(model=model_id, messages=list(messages), temperature=temperature)
+    if provider == "hf":
+        api_key = os.environ.get("HF_TOKEN")
+        if not api_key:
+            raise RuntimeError("HF_TOKEN missing — required for hf/* models")
+        client = OpenAI(api_key=api_key, base_url="https://router.huggingface.co/v1")
+        is_reasoning = False  # HF inference doesn't use OpenAI's reasoning param shape
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY missing")
+        client = OpenAI(api_key=api_key)
+        # GPT-5.x reasoning models reject `max_tokens` and `temperature`.
+        is_reasoning = model_id.startswith(("gpt-5", "o1", "o3", "o4"))
+
+    kwargs: dict = dict(model=model_id, messages=list(messages))
+    if not is_reasoning:
+        kwargs["temperature"] = temperature
     if tools:
         kwargs["tools"] = list(tools)
         kwargs["tool_choice"] = "auto"
     if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    if response_format is not None:
+        if is_reasoning:
+            kwargs["max_completion_tokens"] = max_tokens
+        else:
+            kwargs["max_tokens"] = max_tokens
+    if response_format is not None and provider == "openai":
         kwargs["response_format"] = dict(response_format)
 
     resp = client.chat.completions.create(**kwargs)
@@ -251,7 +274,9 @@ def call(
         resp = _call_anthropic(model_id=model_id, messages=messages, tools=tools,
                                temperature=temperature, max_tokens=max_tokens)
     else:
-        resp = _call_openai(model_id=model_id, messages=messages, tools=tools,
+        # openai OR hf — both use OpenAI-compatible HTTP API
+        resp = _call_openai(provider=provider, model_id=model_id,
+                            messages=messages, tools=tools,
                             temperature=temperature, max_tokens=max_tokens,
                             response_format=response_format)
     resp.elapsed_sec = time.time() - t0

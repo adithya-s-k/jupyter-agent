@@ -120,10 +120,16 @@ timeout_sec = 120.0
 EXPECTED_ANSWER = "{answer_esc}"
 QUESTION = "{question_esc}"
 REWARD_MODE = "{reward_mode}"
+ATOL = "{atol}"
+RTOL = "{rtol}"
 OPENAI_API_KEY = "${{OPENAI_API_KEY}}"
 
 [agent]
-timeout_sec = 900.0
+# Capped at 600s (10 min) to kill the long-tail stuck-agent cases without
+# cutting off legitimate complex trials. Median Phase B trial is 60-120s;
+# legitimate L4/L5 tasks can hit 200-300s; anything past 600s is almost
+# certainly a stuck agent loop.
+timeout_sec = 600.0
 
 [solution.env]
 '''
@@ -167,24 +173,59 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
 
 
+def _infer_tolerances(answer: str) -> tuple[float, float]:
+    """Pick per-task numeric (atol, rtol) from the gold answer's magnitude.
+
+    Heuristic, not formal:
+      - non-numeric or integer gold     → (0,        0)        exact int match
+      - 1-2 decimals (e.g. "21.3")     → (0.05,     0.01)
+      - 3+ decimals (e.g. "0.544341") → (1e-3,     0.005)
+      - very large numbers (>1e6)      → (0,        0.005)
+    """
+    s = str(answer).strip()
+    try:
+        v = float(s.replace(",", ""))
+    except ValueError:
+        return (0.0, 0.0)
+    # integer
+    if "." not in s and "e" not in s.lower():
+        return (0.0, 0.0)
+    # count decimals
+    decimals = len(s.split(".")[1]) if "." in s else 0
+    if abs(v) > 1e6:
+        return (0.0, 0.005)
+    if decimals >= 3:
+        return (1e-3, 0.005)
+    return (0.05, 0.01)
+
+
 def build_spec(row: Mapping, *, suite: str = DEFAULT_SUITE,
                data_bucket_id: str = DEFAULT_DATA_BUCKET_ID,
                out_root: Path | None = None,
                overwrite: bool = False) -> Path:
     """Generate a Harbor task folder for one manifest row.
 
-    Returns the path to the created task dir.
+    New specs go to `<suite>/pending/<id>/`. If the task already exists in
+    *any* bucket (verified/dropped/phase_b_failed/pending), it's returned
+    in-place — unless `overwrite=True`, in which case the existing dir is
+    deleted and a fresh one created in pending/.
+
+    Returns the path to the (re)created task dir.
     """
+    from .buckets import find_task_dir, ensure_bucket
+
     out_root = out_root or TASKS_DIR
+    suite_dir = out_root / suite
     task_id = str(row["id"])
     safe = id_safe(task_id)
-    out_dir = out_root / suite / safe
 
-    if out_dir.exists() and not overwrite:
-        return out_dir
-    if out_dir.exists() and overwrite:
-        shutil.rmtree(out_dir)
+    existing = find_task_dir(suite_dir, safe)
+    if existing is not None and not overwrite:
+        return existing
+    if existing is not None and overwrite:
+        shutil.rmtree(existing)
 
+    out_dir = ensure_bucket(suite_dir, "pending") / safe
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tests").mkdir(exist_ok=True)
     (out_dir / "environment").mkdir(exist_ok=True)
@@ -195,6 +236,9 @@ def build_spec(row: Mapping, *, suite: str = DEFAULT_SUITE,
     package_tier = int(pt) if pt is not None else 0
     fu = row.get("files_used")
     files_used = list(fu) if fu is not None else []
+
+    # --- per-task numeric tolerance (only used by numeric / flexible modes)
+    atol, rtol = _infer_tolerances(str(row["answer"]))
 
     # --- task.toml
     task_toml = TASK_TOML_TEMPLATE.format(
@@ -208,6 +252,8 @@ def build_spec(row: Mapping, *, suite: str = DEFAULT_SUITE,
         package_tier=package_tier,
         data_bucket_id=data_bucket_id,
         bucket_prefix=kaggle_to_bucket_prefix(kaggle),
+        atol=atol,
+        rtol=rtol,
     )
     (out_dir / "task.toml").write_text(task_toml)
 
