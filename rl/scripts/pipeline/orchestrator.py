@@ -17,7 +17,7 @@ class RunConfig:
     state_store: StateStore
     suite_name: str = DEFAULT_SUITE
     model: str = "anthropic/claude-sonnet-4-6"
-    k_max: int = 3
+    k_max: int = 1                            # default: doctor fires after 1 fail
     sandbox: str = "docker"
     rewrite_spec: bool = False
     # Phase C (doctor)
@@ -56,7 +56,7 @@ def _run_phase_b(*, row, cfg: RunConfig, spec_dir: Path, state: StateStore,
         result = run_trial(
             suite_path=spec_dir.parent, task_id=task_id, model=cfg.model,
             job_name=job_name, jobs_dir=jobs_dir,
-            sandbox=cfg.sandbox, log_dir=state.state_dir / "logs",
+            sandbox=cfg.sandbox, log_dir=state.logs_dir,
         )
         trial_results.append(result)
         total_cost += result.cost_usd
@@ -95,7 +95,7 @@ def process_task(row: Mapping, cfg: RunConfig) -> dict:
     """Run one full per-task pipeline. Returns the final decision dict."""
     task_id = str(row["id"])
     state = cfg.state_store
-    jobs_dir = state.state_dir / "trials"
+    jobs_dir = state.trials_dir   # per-run trials/ folder
 
     state.append_event(event="task_start", task_id=task_id, phase="A")
 
@@ -140,7 +140,7 @@ def process_task(row: Mapping, cfg: RunConfig) -> dict:
     # --- PHASE C: doctor (if Phase B failed and enabled)
     if b["passing"] is None and cfg.enable_doctor:
         from .doctor import run_doctor
-        specs_archive_dir = state.state_dir / "specs" / id_safe(task_id)
+        specs_archive_dir = state.specs_dir / id_safe(task_id)
         trial_dirs = [t.trial_dir for t in b["trials"]]
         d = run_doctor(
             row=row, spec_dir=spec_dir, trial_dirs=trial_dirs,

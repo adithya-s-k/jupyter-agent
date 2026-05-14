@@ -37,7 +37,10 @@ ALLOWED_PROBE_MODELS = {
     "gpt-5.5-codex": "openai/gpt-5.5-codex",
 }
 
-ALLOWED_TOML_FIELDS = {"REWARD_MODE", "EXPECTED_ANSWER", "ATOL", "RTOL", "ANSWER_TYPE"}
+ALLOWED_TOML_FIELDS = {
+    "REWARD_MODE", "EXPECTED_ANSWER", "ATOL", "RTOL", "ANSWER_TYPE",
+    "QUESTION",        # last resort — see doctor_system.md
+}
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +84,15 @@ TOOLS: list[dict] = [
     }},
     {"type": "function", "function": {
         "name": "edit_task_toml",
-        "description": "Set a field in [verifier.env] of task.toml. Allowed fields: REWARD_MODE, EXPECTED_ANSWER, ATOL, RTOL, ANSWER_TYPE. The pre-edit task.toml is snapshotted to specs/<id>/v0.toml automatically.",
+        "description": (
+            "Set a field in [verifier.env] of task.toml. Allowed fields: "
+            "REWARD_MODE, EXPECTED_ANSWER, ATOL, RTOL, ANSWER_TYPE, QUESTION. "
+            "QUESTION is a last-resort edit — only use when the question itself "
+            "is genuinely ambiguous and you've tried everything else. "
+            "The pre-edit task.toml is snapshotted to specs/<id>/v0.toml automatically. "
+            "When you edit QUESTION, also call edit_instruction to update "
+            "instruction.md's matching question line — they MUST stay in sync."
+        ),
         "parameters": {"type": "object", "properties": {
             "field": {"type": "string", "enum": list(ALLOWED_TOML_FIELDS)},
             "value": {"type": "string"},
@@ -158,10 +169,28 @@ def _read_trial_artifacts(trial_dir: Path) -> dict:
     return out
 
 
+def _bucket_files_static(row: Mapping) -> list[str]:
+    """Quick (~1s) call to enumerate the kaggle bucket prefix for this task."""
+    try:
+        from huggingface_hub import list_bucket_tree
+        kaggle = row["kaggle_dataset_name"]
+        bucket = "AdithyaSK/jupyter-agent-kaggle-all"
+        prefix = str(kaggle).replace("/", "__") + "/"
+        return [
+            Path(it.path).name
+            for it in list_bucket_tree(bucket, prefix=prefix, recursive=True)
+            if getattr(it, "type", None) == "file"
+        ]
+    except Exception as e:  # noqa: BLE001
+        return [f"(bucket listing failed: {e})"]
+
+
 def build_dossier(row: Mapping, spec_dir: Path, trial_dirs: list[Path]) -> str:
     """Construct the up-front user message: full run context for the doctor."""
     task_toml = (spec_dir / "task.toml").read_text() if (spec_dir / "task.toml").exists() else "(missing)"
     instruction = (spec_dir / "instruction.md").read_text() if (spec_dir / "instruction.md").exists() else "(missing)"
+
+    bucket_files = _bucket_files_static(row)
 
     trial_blocks: list[str] = []
     for idx, td in enumerate(trial_dirs):
@@ -181,13 +210,16 @@ def build_dossier(row: Mapping, spec_dir: Path, trial_dirs: list[Path]) -> str:
             f"  (full trajectory available via read_trajectory({idx}))"
         )
 
-    files_used = list(row.get("files_used") or [])
+    fu = row.get("files_used")
+    files_used = list(fu) if fu is not None else []
+    bucket_files_str = "\n  ".join(bucket_files) if bucket_files else "(empty or unreachable)"
     return (
         f"TASK ID:          {row['id']}\n"
         f"QUESTION:         {row['question']}\n"
         f"GOLD ANSWER:      {row['answer']}\n"
         f"KAGGLE DATASET:   {row['kaggle_dataset_name']}\n"
-        f"FILES USED:       {files_used}\n"
+        f"FILES USED (from manifest): {files_used}\n"
+        f"BUCKET FILES (actual):\n  {bucket_files_str}\n\n"
         f"REWARD_MODE:      {row.get('reward_mode_initial', '?')}\n"
         f"ANSWER_TYPE:      {row.get('answer_type', '?')}  (heuristic from classifier)\n"
         f"PACKAGE_TIER:     {row.get('package_tier', '?')}\n\n"
@@ -329,7 +361,7 @@ def _dispatch_tool(name: str, args: dict, ctx: DoctorCtx) -> tuple[str, dict]:
         result: TrialResult = run_trial(
             suite_path=suite_path, task_id=task_id, model=full_model,
             job_name=job_name, jobs_dir=ctx.jobs_dir,
-            sandbox="docker", log_dir=ctx.state.state_dir / "logs",
+            sandbox="docker", log_dir=ctx.state.logs_dir,
         )
         ctx.probe_trial_dirs.append(result.trial_dir)
         ctx.state.append_event(
@@ -440,7 +472,9 @@ def run_doctor(*, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
 
     for turn in range(max_calls + 4):  # extra slack for tool-result roundtrips
         resp = llm_client.call(model=model, messages=messages, tools=TOOLS,
-                               temperature=temperature)
+                               temperature=temperature,
+                               state=state, task_id=task_id,
+                               phase="C", call_kind="doctor")
         total_doctor_cost += resp.cost_usd
         state.append_event(
             event="doctor_turn", task_id=task_id, phase="C",

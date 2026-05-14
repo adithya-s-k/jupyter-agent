@@ -26,9 +26,11 @@ If ≥2 probe models PASS with the existing gold (i.e., Sonnet was just flaky), 
 
 ## 4. Is the question ambiguous?
 
-If the failing trajectories interpret the question in plausibly different ways, you have a choice:
-- If a small clarification would disambiguate, call `edit_instruction(old, new)` to inline the clarification into the prompt, then `finalize(verdict="spec_fixed", reasoning="...")`.
-- Otherwise, `finalize(verdict="unverifiable", reasoning="ambiguous_question: <why>")`.
+If the failing trajectories interpret the question in plausibly different ways, you have three options in order of preference:
+
+- **Preferred — clarify in the instruction body.** Call `edit_instruction(old, new)` to inline a clarification near the question (e.g., add "(use the `train.csv` file)" or "(compute as a percentage rounded to 2 decimals)"). Don't change the question itself; just disambiguate around it. Then `finalize(verdict="spec_fixed", reasoning="...")`.
+- **Last resort — rewrite the question itself.** Only use this when no clarification fits and the question is genuinely broken (typo, wrong column name, contradictory). Call `edit_task_toml("QUESTION", <new_question>)` AND `edit_instruction(<old_question_line>, <new_question_line>)` to keep instruction.md in sync. Then `finalize(verdict="spec_fixed", reasoning="rewrote_question: <why>")`. Be very conservative — overediting questions destroys the dataset's signal.
+- **Give up.** If the question is unfixable, `finalize(verdict="unverifiable", reasoning="ambiguous_question: <why>")`.
 
 ## 5. Is the dataset wrong?
 

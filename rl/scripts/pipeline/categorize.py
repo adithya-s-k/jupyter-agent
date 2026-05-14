@@ -1,6 +1,7 @@
 """Phase D — categorize a verified task on a 1-5 difficulty scale.
 
-D1 (RUBRIC, Sonnet): one judge call. Required.
+D1 (RUBRIC, Sonnet): one judge call. Required. Structured output via Pydantic
+                     validation; the rubric prompt requests exact JSON shape.
 D2 (EMPIRICAL, gpt-4o): one extra seta trial. Optional, off by default.
 """
 
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from pydantic import BaseModel, Field, ValidationError, conint, confloat
+
 from . import llm_client
 
 
@@ -23,37 +26,44 @@ _PROMPT_PATH = Path(__file__).parent / "prompts" / "categorize.md"
 CATEGORIZE_SYSTEM_PROMPT = _PROMPT_PATH.read_text()
 
 
+# Structured output schema. Sonnet returns a JSON object that must validate.
+class CategorizeOutput(BaseModel):
+    level: conint(ge=1, le=5)   # type: ignore[valid-type]
+    reasoning: str = Field(..., min_length=1, max_length=2000)
+    confidence: confloat(ge=0.0, le=1.0)  # type: ignore[valid-type]
+    signal: str = ""
+
+
 @dataclass
 class CategorizeResult:
-    level: int                  # 1-5; 0 if parsing failed
+    level: int
     reasoning: str
     confidence: float
     signal: str
     raw: str
+    parse_ok: bool
     cost_usd: float
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
-    # D2 — only set when run_empirical=True
     empirical_easy: bool | None = None
     empirical_probe_cost_usd: float = 0.0
     empirical_predicted: str = ""
 
 
 def _passing_trajectory_excerpt(trial_dir: Path, max_chars: int = 6000) -> str:
-    """Pull out the code cells (and key outputs) from a passing trial."""
     if trial_dir is None:
         return "(no passing trial dir captured)"
+    msgs = None
     for f in (trial_dir / "agent").glob("*.trajectory.json"):
         try:
             msgs = json.loads(f.read_text())
         except Exception:
             return "(could not parse trajectory)"
         break
-    else:
+    if msgs is None:
         return "(no trajectory.json found)"
 
-    # Extract only the tool calls (code cells) — that's what determines difficulty
     out: list[str] = []
     for m in msgs:
         if m.get("role") != "assistant":
@@ -62,7 +72,6 @@ def _passing_trajectory_excerpt(trial_dir: Path, max_chars: int = 6000) -> str:
             fn = tc.get("function") or {}
             name = fn.get("name", "")
             args = fn.get("arguments", "")
-            # Truncate each cell to keep total size bounded
             args_s = str(args)[:600]
             out.append(f"--- TOOL {name}\n{args_s}")
     joined = "\n".join(out)
@@ -71,8 +80,7 @@ def _passing_trajectory_excerpt(trial_dir: Path, max_chars: int = 6000) -> str:
     return joined or "(no tool calls found)"
 
 
-def _parse_json(text: str) -> dict | None:
-    # Strip ```json fences if present
+def _extract_json(text: str) -> dict | None:
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t)
@@ -80,7 +88,6 @@ def _parse_json(text: str) -> dict | None:
     try:
         return json.loads(t)
     except json.JSONDecodeError:
-        # try to find the first { ... } block
         m = re.search(r"\{.*\}", t, re.DOTALL)
         if m:
             try:
@@ -92,38 +99,56 @@ def _parse_json(text: str) -> dict | None:
 
 def categorize_rubric(*, row: Mapping, passing_trial_dir: Path,
                       model: str = CATEGORIZE_MODEL,
-                      temperature: float = 0.0) -> CategorizeResult:
+                      temperature: float = 0.0,
+                      state=None) -> CategorizeResult:
     excerpt = _passing_trajectory_excerpt(passing_trial_dir)
     user_msg = (
         f"QUESTION: {row['question']}\n"
         f"GOLD: {row['answer']}\n\n"
         f"PASSING TRAJECTORY EXCERPT (tool calls in order):\n{excerpt}\n\n"
-        "Categorize. Output JSON only — no prose."
+        "Output a JSON object matching this exact schema and nothing else:\n"
+        '  {"level": <1|2|3|4|5>, "reasoning": "<one sentence>", '
+        '"confidence": <0.0-1.0>, "signal": "<what tipped you off>"}'
     )
     messages = [
         {"role": "system", "content": CATEGORIZE_SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
     ]
-    resp = llm_client.call(model=model, messages=messages,
-                           temperature=temperature, max_tokens=400)
+    resp = llm_client.call(
+        model=model, messages=messages,
+        temperature=temperature, max_tokens=400,
+        state=state, task_id=str(row["id"]), phase="D", call_kind="categorize_rubric",
+        response_format={"type": "json_object"},  # ignored on Anthropic, hint for OpenAI
+    )
 
-    parsed = _parse_json(resp.content)
-    if parsed is None:
+    parsed_raw = _extract_json(resp.content)
+    if parsed_raw is None:
         return CategorizeResult(
             level=0, reasoning=f"parse_error: {resp.content[:200]}",
             confidence=0.0, signal="parse_error",
-            raw=resp.content, cost_usd=resp.cost_usd,
-            prompt_tokens=resp.prompt_tokens,
-            completion_tokens=resp.completion_tokens,
-            cached_tokens=resp.cached_tokens,
+            raw=resp.content, parse_ok=False,
+            cost_usd=resp.cost_usd, prompt_tokens=resp.prompt_tokens,
+            completion_tokens=resp.completion_tokens, cached_tokens=resp.cached_tokens,
+        )
+
+    try:
+        validated = CategorizeOutput.model_validate(parsed_raw)
+    except ValidationError as e:
+        return CategorizeResult(
+            level=0, reasoning=f"schema_error: {e!s}",
+            confidence=0.0, signal="schema_error",
+            raw=resp.content, parse_ok=False,
+            cost_usd=resp.cost_usd, prompt_tokens=resp.prompt_tokens,
+            completion_tokens=resp.completion_tokens, cached_tokens=resp.cached_tokens,
         )
 
     return CategorizeResult(
-        level=int(parsed.get("level") or 0),
-        reasoning=str(parsed.get("reasoning") or ""),
-        confidence=float(parsed.get("confidence") or 0.0),
-        signal=str(parsed.get("signal") or ""),
+        level=int(validated.level),
+        reasoning=validated.reasoning,
+        confidence=float(validated.confidence),
+        signal=validated.signal,
         raw=resp.content,
+        parse_ok=True,
         cost_usd=resp.cost_usd,
         prompt_tokens=resp.prompt_tokens,
         completion_tokens=resp.completion_tokens,
@@ -133,10 +158,6 @@ def categorize_rubric(*, row: Mapping, passing_trial_dir: Path,
 
 def empirical_probe(*, row: Mapping, suite_path: Path, jobs_dir: Path,
                     state, k_max: int = 1) -> dict:
-    """Run gpt-4o + seta + K=1 as a cheap difficulty cross-check.
-
-    Returns: {passed: bool, predicted: str, cost_usd: float, trial_dir}
-    """
     from .verify import run_trial
     from .build import id_safe
 
@@ -149,7 +170,7 @@ def empirical_probe(*, row: Mapping, suite_path: Path, jobs_dir: Path,
     result = run_trial(
         suite_path=suite_path, task_id=task_id, model=EMPIRICAL_PROBE_MODEL,
         job_name=job_name, jobs_dir=jobs_dir,
-        sandbox="docker", log_dir=state.state_dir / "logs",
+        sandbox="docker", log_dir=state.logs_dir,
     )
     state.append_event(
         event="empirical_finish", task_id=task_id, phase="D",
@@ -171,8 +192,7 @@ def empirical_probe(*, row: Mapping, suite_path: Path, jobs_dir: Path,
 def categorize(*, row: Mapping, passing_trial_dir: Path,
                suite_path: Path | None = None, jobs_dir: Path | None = None,
                state=None, run_empirical: bool = False) -> CategorizeResult:
-    """Phase D entry point: rubric (always) + empirical (optional)."""
-    result = categorize_rubric(row=row, passing_trial_dir=passing_trial_dir)
+    result = categorize_rubric(row=row, passing_trial_dir=passing_trial_dir, state=state)
 
     if run_empirical and suite_path and jobs_dir and state is not None:
         probe = empirical_probe(row=row, suite_path=suite_path,
