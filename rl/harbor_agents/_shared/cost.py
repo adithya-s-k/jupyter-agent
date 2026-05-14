@@ -27,7 +27,7 @@ from typing import Any
 
 import yaml
 
-_TABLE_PATH = Path(__file__).resolve().parents[2] / "cache" / "sweep" / "cost_table.yaml"
+_TABLE_PATH = Path(__file__).resolve().parent / "cost_table.yaml"
 _TABLE_CACHE: dict[str, dict[str, float]] | None = None
 
 

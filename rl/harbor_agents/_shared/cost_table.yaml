@@ -1,0 +1,37 @@
+# Per-1M-token prices in USD. Updated 2026-05-14.
+# Provider suffixes (`:nscale`, `:scaleway`, `:fastest`, …) are stripped before
+# lookup, so we only need the bare model id here.
+#
+# Schema:
+#   <model_id>:
+#     input:   $ per 1M prompt (non-cached) tokens
+#     output:  $ per 1M completion tokens
+#     cached:  $ per 1M cached input tokens (defaults to input/10 if absent)
+prices:
+  # ── OpenAI native ────────────────────────────────────────────────────────
+  # Pricing confirmed via OpenAI API docs + OpenRouter (2026-05-14 web search).
+  "gpt-5.5":              {input:  5.00, output: 30.00, cached: 0.50}
+  "gpt-5.5-codex":        {input:  5.00, output: 30.00, cached: 0.50}
+  "gpt-5.5-pro":          {input: 30.00, output: 180.00, cached: 3.00}
+  "gpt-5":                {input:  1.25, output: 10.00, cached: 0.125}
+  "gpt-4o":               {input:  2.50, output: 10.00, cached: 1.25}
+  "gpt-4o-mini":          {input:  0.15, output:  0.60, cached: 0.075}
+
+  # ── Anthropic (via api.anthropic.com/v1 OpenAI-compat shim) ─────────────
+  # Sonnet 4.6 + Opus 4.7 confirmed from platform.claude.com/docs/en/about-claude/pricing.
+  "claude-sonnet-4-6":    {input:  3.00, output: 15.00, cached: 0.30}
+  "claude-opus-4-7":      {input:  5.00, output: 25.00, cached: 0.50}
+  "claude-haiku-4-5":     {input:  0.80, output:  4.00, cached: 0.08}
+
+  # ── HF Inference Providers (Qwen3 family) ────────────────────────────────
+  # Prices are provider-list (Nscale/Scaleway typical); will be re-tracked
+  # against actual invoices.
+  "Qwen/Qwen3-4B-Instruct-2507":         {input: 0.05, output: 0.15}
+  "Qwen/Qwen3-4B-Thinking-2507":         {input: 0.05, output: 0.15}
+  "Qwen/Qwen3-8B":                       {input: 0.10, output: 0.30}
+  "Qwen/Qwen3-14B":                      {input: 0.20, output: 0.60}
+  "Qwen/Qwen3-32B":                      {input: 0.40, output: 1.20}
+  "Qwen/QwQ-32B":                        {input: 0.40, output: 1.20}
+  "Qwen/Qwen3-Coder-30B-A3B-Instruct":   {input: 0.10, output: 0.30}   # MoE 3B active
+  "Qwen/Qwen3-235B-A22B-Instruct-2507":  {input: 0.80, output: 2.40}
+  "Qwen/Qwen3-235B-A22B":                {input: 0.80, output: 2.40}

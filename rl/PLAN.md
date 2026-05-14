@@ -1,644 +1,451 @@
-# Jupyter Agent — Pipeline Plan
+# Data-Agent RL — Pipeline Plan
 
-Two stages. **Stage 1 is shipped** (commit `83a1949`). **Stage 2 is the next build** — an OpenReward (ORS) server that exposes the same 5 jupyter tools as `JupyterToolAgent`, for RL training rollouts.
-
----
-
-# Stage 1 — Harbor task suite + HF Bucket (DONE)
+> Renaming the project from "jupyter-agent" → **data-agent**. The repo lives in `rl/` (legacy name) but everything we generate from this point forward uses `data-agent` / `data_agent` naming so it can be told apart from the prior eval-v1 / sweep-v2 work.
 
 ---
 
-## 30-second mental model
+## Context (one-pager)
 
-```
-ONE SUITE = one `--name <slug>`  →  one HF Bucket + one HF Dataset repo
+- The cached dataset at `data/raw/{thinking,non_thinking}.parquet` contains **51,388 unique rows**.
+- The two splits share `(id, question, answer, kaggle_dataset_name)` 100% — only the `messages` trace differs. So we read from `thinking.parquet` only and ignore the other.
+- Of those, **29,561 rows have `executor_type = e2b`** and a coherent Kaggle dataset name. The remaining 21,827 `executor_type = llm` rows have mismatched Kaggle metadata (the `kaggle_dataset_name` field doesn't match the file paths in the notebook) and LLM-hallucinated answers — **drop entirely**.
+- **Gold answers are not 100% trustworthy.** A non-trivial fraction were produced by the original simulation pipeline and may be stale, formatted oddly, or computed against a different snapshot of the data. The verification pipeline must handle this gracefully (frontier consensus, gold auto-correction).
 
-    cache_dataset.py
-       │ downloads jupyter-agent/jupyter-agent-dataset once (~72 GB)
-       ▼
-  cache/raw/{thinking,non_thinking}.parquet
-       │
-       │  build_harbor_tasks.py --name test --n-tasks 5
-       │  - filter, dedupe, sample N
-       │  - kagglehub download per unique dataset (parallel)
-       │  - emit task folders (instruction.md, task.toml, tests/, environment/)
-       ▼
-  harbor/tasks/jupyter-agent-test/
-       │       │
-       │       ├── manifest.jsonl
-       │       ├── data/<prefix>/             ← local mirror (kagglehub→local)
-       │       │                                  KEPT for offline dev only;
-       │       │                                  NOT baked into images.
-       │       └── <safe_id>/
-       │             ├── instruction.md       ← rendered prompt
-       │             ├── task.toml            ← [environment.env] HF_BUCKET, BUCKET_PREFIX
-       │             │                          [environment.healthcheck] pull_bucket.py
-       │             │                          [verifier.env] EXPECTED_ANSWER, QUESTION, OPENAI_API_KEY
-       │             ├── tests/{test.sh,grader.py}
-       │             └── environment/{Dockerfile,pull_bucket.py}    ← no data/
-       │
-       │  stage_data.py --name test
-       │  - syncs local data/<prefix>/ → hf://buckets/<user>/<slug>-data/<prefix>/
-       │
-       │  push_harbor.py --name test
-       │  - uploads spec folders (excluding data/) → hf://datasets/<user>/<slug>-harbor
-       ▼
-  PUBLISHED ARTIFACTS:
-    hf://buckets/<user>/jupyter-agent-<slug>-data/       ← canonical data
-    hf://datasets/<user>/jupyter-agent-<slug>-harbor     ← spec only, tiny
+**Goal:** from 29,561 e2b rows, produce a HF-Hub-published `data_agent_rl` dataset with:
+- `eval` split: 1,000 *candidate* rows (the "eval pool") of which some subset survives verification → final eval set.
+- `train` split: the remaining ~28,500 rows, run through a cheaper single-pass verification.
 
-         │ consumed at runtime:
-         ▼
-  harbor run -p <path> -a <agent> -m <model> -e <sandbox> --env-file ../.env
-    1. Build Dockerfile (env/Dockerfile, no data baked)
-    2. Start container
-    3. [environment.healthcheck] runs:
-          python3 /opt/pull_bucket.py
-          → pulls hf://buckets/<bucket-id>/<bucket-prefix>/ into /home/user/input/
-       must pass before agent setup begins
-    4. Agent setup + run (opencode / codex / JupyterToolAgent / etc.)
-    5. Agent writes /workdir/answer.txt OR submits via tool
-    6. Verifier runs tests/test.sh → tests/grader.py → /logs/verifier/reward.txt
-```
+We perfect the pipeline on the 1,000 eval pool first, then scale to the train pool.
 
 ---
 
-## Components — what each file does
+## Naming conventions (lock these everywhere)
 
-### Source data (read-only)
-- `cache/raw/{thinking,non_thinking}.parquet` — 51,389 rows × 2 splits, cached from `jupyter-agent/jupyter-agent-dataset`. Ground truth for tasks.
-
-### Shared helpers
-- `grader.py` — 3-tier grader (exact / numeric tolerance / LLM-judge with gpt-4o-mini, simple-evals A/B/C prompt). Used by:
-  - `tests/test.sh` (Harbor CLI eval path — copy of this file per task)
-  - `JupyterToolAgent` (future — same logic for in-loop reward)
-
-### `prepare/cache_dataset.py`
-Downloads source dataset to local cache. One-time, ~72 GB. Done already.
-
-### `prepare/build_harbor_tasks.py` ← current state after recent edits
-For `--name <slug> --n-tasks N`:
-
-1. Resolve names — base=`jupyter-agent-<slug>`, bucket=`<user>/<base>-data`, repo=`<user>/<base>-harbor`, local dir=`harbor/tasks/<base>/`
-2. Load `cache/raw/non_thinking.parquet`, filter (e2b + non-null kaggle + non-null answer), dedupe by (kaggle, question), keep highest edu_score
-3. Pick `N × multiplier` candidate rows, deterministic shuffle
-4. **kagglehub download** every UNIQUE kaggle dataset among candidates, in parallel
-5. Filter rows to those whose kaggle dataset succeeded
-6. Take first N
-7. Mirror downloaded files to `harbor/tasks/<base>/data/<prefix>/` (shared, deduped — offline-dev convenience)
-8. For each accepted row, emit `<safe_id>/`:
-   - `instruction.md` — rendered from `data/pipelines/prompts/agent_prompt_e2b.md`
-   - `task.toml` — schema 1.2; `[environment.env]` carries HF_BUCKET/BUCKET_PREFIX/HF_TOKEN; **`[environment.healthcheck]` calls `python3 /opt/pull_bucket.py`** (pre-agent hook); `[verifier.env]` carries EXPECTED_ANSWER/QUESTION/OPENAI_API_KEY
-   - `tests/test.sh` — shells `python3 /tests/grader.py` against `/workdir/answer.txt`
-   - `tests/grader.py` — copy of root `grader.py`
-   - `environment/Dockerfile` — `python:3.12-slim` + huggingface_hub + pandas/numpy/etc.; **no `COPY data`**
-   - `environment/pull_bucket.py` — invoked by healthcheck; reads `HF_BUCKET` + `BUCKET_PREFIX` env vars, fetches files via `download_bucket_files`
-9. Write `manifest.jsonl` (safe_id → bucket_prefix → kaggle_dataset_name → files_used)
-10. Write `README.md`
-
-### `prepare/stage_data.py`
-For `--name <slug>`: read `manifest.jsonl`, sync each unique prefix from local `data/<prefix>/` → `hf://buckets/<user>/<base>-data/<prefix>/` via `sync_bucket` (Xet-chunked, parallel, idempotent).
-
-### `prepare/push_harbor.py`
-For `--name <slug>`: `create_repo("<user>/<base>-harbor", type="dataset", exist_ok=True)` + `upload_folder(harbor/tasks/<base>/)` with `ignore_patterns=["data/**", ...]`. Spec-only push.
-
-### `harbor_agents/jupyter.py` + `kernel_server.py` + `run_cell.py`
-Custom Harbor `BaseAgent` exposing 5 jupyter-style tools:
-- `add_and_execute_code_cell(code)` — stateful Python kernel (via in-container HTTP server)
-- `edit_and_execute_current_cell(code)` — replace last cell, re-run
-- `execute_shell_command(command)` — direct `env.exec(command)`
-- `get_notebook_state(include_images)` — in-agent tracker summary
-- `final_answer(answer)` — writes `/workdir/answer.txt`, ends episode
-
-Invoked via `harbor run --agent-import-path harbor_agents.jupyter:JupyterToolAgent`.
+| Concept | Name |
+|---|---|
+| Project (going forward) | `data-agent` |
+| Python package / cached dirs (snake_case) | `data_agent` |
+| HF Hub dataset | `AdithyaSK/data_agent_rl` (splits: `train`, `eval`) |
+| Harbor task suite (eval pool) | `data-agent-eval-v1` |
+| Harbor task suite (train pool) | `data-agent-train-v1` |
+| HF Hub kaggle bucket (reused) | `AdithyaSK/jupyter-agent-kaggle-all` (keep the old name — only the source-data bucket, no rebrand needed) |
+| Local file names | snake_case: `eval_ids.txt`, `train_manifest.parquet`, etc. |
+| Old artifacts | All under `_archive/` — never delete, just isolate |
 
 ---
 
-## End-to-end command sequence (current shape)
+## Target folder structure (the restructure)
 
-```bash
-# 0. ONE-TIME — cache source dataset (~72 GB)
-uv run python -m prepare.cache_dataset --confirm
-
-# 1. PER-SUITE — pick N tasks, download kaggle data, emit Harbor folders
-uv run python -m prepare.build_harbor_tasks --name test --n-tasks 5
-
-# 2. Sync data → HF Bucket
-uv run python -m prepare.stage_data --name test
-
-# 3. (optional) Push spec → HF Hub
-uv run python -m prepare.push_harbor --name test
-
-# 4. RUN — local Docker with stock CLI agent (opencode/codex/etc.)
-harbor run \
-  --path harbor/tasks/jupyter-agent-test \
-  --agent opencode --env docker --model openai/gpt-5 \
-  --env-file ../.env --ae OPENAI_API_KEY="$OPENAI_API_KEY"
-
-# 4'. RUN — E2B cloud sandbox
-harbor run --path ... --agent opencode --env e2b ...
-
-# 4''. RUN — custom 5-tool agent
-harbor run --path ... \
-  --agent-import-path harbor_agents.jupyter:JupyterToolAgent \
-  --model openai/gpt-5 \
-  --env-file ../.env --ae OPENAI_API_KEY="$OPENAI_API_KEY"
-```
-
----
-
-## What we've verified working (today)
-
-| Run | Sandbox | Agent | Model | Reward | Time |
-|---|---|---|---|---|---|
-| Insurance R² task (gold=0.7487) | docker | nop | — | 0.0 | 39 s (smoke — container/verifier wire-up) |
-| Insurance R² task | docker | opencode | gpt-4o-mini | 0.0 (overfit) | 1m 20 s |
-| Insurance R² task | docker | opencode | **gpt-5** | **1.0** | 1m 6 s |
-| Insurance R² task | **e2b** | opencode | **claude-sonnet-4-5** | **1.0** | 1m 19 s |
-| Insurance R² task | docker | **JupyterToolAgent** | gpt-5 | **1.0** | 0m 59 s |
-| Insurance R² task | docker | opencode | gpt-5 | **1.0** | 1m 38 s | ← **bucket-only variant: NO `COPY data`, healthcheck pulled from bucket** |
-
-Same task spec across all rows. Same HF Bucket as the data source. Different sandbox providers, agents, and models all converge on reward 1.0.
-
----
-
-## Locked decisions (current state)
-
-- **Slug naming** — `jupyter-agent-<slug>` → `<user>/<base>-data` (bucket) + `<user>/<base>-harbor` (dataset repo). Default user: `AdithyaSK`.
-- **Bucket is canonical** — runtime data path is always the bucket; local mirror is offline-dev convenience.
-- **Healthcheck = pre-agent hook** — `[environment.healthcheck]` in task.toml runs `pull_bucket.py` before agent setup. Confirmed to work with both stock CLI agents and the custom `JupyterToolAgent`.
-- **5 jupyter tools** — verbatim from `references/RL_Envs_101/envs/jupyter_env/ors/server.py` for both Harbor agent and (later) OpenReward server.
-- **Grader** — 3 tiers in `grader.py`: exact / numeric (rel/abs ≤ 1e-3) / LLM-judge (gpt-4o-mini, simple-evals A/B/C). Used by both `tests/test.sh` and (future) `final_answer @tool`.
-- **HF SDK** — `huggingface_hub>=1.12` (bucket API + `hf_xet`). `HF_XET_HIGH_PERFORMANCE=1`. No `hf_transfer`.
-
----
-
-## Pending — what to iterate on
-
-1. **Regenerate the 5 tasks with the bucket-only Dockerfile**. The build script is updated; just need to run `--clean` + smoke-test one task.
-2. **Decide whether to drop the local `data/<prefix>/` mirror entirely** (or leave it as a kagglehub cache for offline runs). Currently kept.
-3. **Push to a clean `<base>-harbor` repo** to verify the bucket-only spec is fully self-contained for a 3rd-person clone.
-4. **`prepare/pull_harbor.py`** for the 3rd-person flow: `snapshot_download` + ready-to-`harbor run`. Tiny — `huggingface_hub.snapshot_download(repo_id="<user>/<base>-harbor", repo_type="dataset")`.
-5. **Run all 5 tasks under one model × sandbox combination** for a real pass-rate number (`harbor run -p <suite>` with `-n 4`).
-6. **OpenReward server** — same 5 tools, HTTP service, per-call rewards. The RL-training-ready twin of `JupyterToolAgent`. Read from the same `harbor/tasks/<base>/` folders.
-7. **TRL/SkyRL trainer** — points at the OpenReward server, RL loop. Out of scope until 6 lands.
-
----
-
----
-
-# Stage 3 — Scale audit, optimizations, benchmark roadmap
-
-Stages 1 + 2 work end-to-end at N=10. This section is the honest answer to "what would break at N=1000, what to optimize, and how to turn this into a published benchmark."
-
-## Scalability bounds (measured + projected)
-
-### Stage 1 — build → bucket → Hub
-
-| Phase | At N=10 today | Projected at N=500 | Projected at N=5000 | Bottleneck |
-|---|---|---|---|---|
-| `build_harbor_tasks` filter + dedupe | ~10 s | ~30 s | ~5 min | parquet scan (single-threaded) |
-| Kagglehub downloads (parallel, 4 workers) | 8 s for 10 unique | ~40 min for 500 unique | ~7 h for 5000 unique | Kaggle API rate limit + per-dataset size |
-| Local data mirror disk | 144 MB | ~10 GB | ~100 GB | local disk |
-| `stage_data` bucket sync (Xet) | 32 s | ~25 min | ~4 h | xet upload throughput; cross-dataset chunk dedup helps a lot |
-| `push_harbor` Hub upload (spec only) | 8 s | ~15 s | ~60 s | tiny — spec files are KB |
-| Bucket cost (private, $18/TB·mo) | $0.003 | $0.18 | $1.80 | negligible |
-| Dataset repo size | 552 KB | ~30 MB | ~300 MB | well under git limits |
-
-**Verdict for Stage 1**: scales to **5000 tasks** without architectural change. Three concrete tunings to apply:
-
-1. **Bump `--max-workers` to 16–32** for `build_harbor_tasks.py` and `stage_data.py`. Kaggle and HF buckets both handle that throughput.
-2. **Resume-on-failure**: persist a `staged.jsonl` checkpoint per dataset; skip those on re-run. Already partial; finish it.
-3. **Streaming pipeline**: don't wait for full kagglehub batch to finish before starting bucket syncs. Pipeline the two stages.
-
-### Stage 2 — ORS server + rollouts
-
-| Concern | At N=1 today (verified) | At ~50 concurrent rollouts | At ~500 concurrent rollouts |
-|---|---|---|---|
-| Server process | single asyncio loop | single, fine | needs replicas behind a load balancer |
-| Sandbox provider | docker local | docker pool or e2b | e2b cloud (only realistic option) |
-| Container cold-start per session | ~30 s (incl. bucket pull) | same | **dominates** unless we pool/cache |
-| Kernel server boot inside container | ~1 s | same | same |
-| LLM inference | seconds per turn | OpenAI/Anthropic rate limits matter | needs higher-tier API quotas |
-| Cost per rollout (gpt-5, 7 turns, ~80k toks) | ~$0.05 | same per-rollout | $25 / batch of 500 |
-
-**Bottleneck order** (where time is actually spent on a single rollout, measured):
-
-1. **LLM inference** (~25 s of the 40 s end-to-end) — model + token volume
-2. **Container start + healthcheck/bucket pull** (~10 s) — same files re-fetched every session
-3. **Kernel server boot + readiness poll** (~1 s)
-4. **Actual code execution** (~few s in our examples)
-
-## Optimizations (ordered by ROI, cheapest first)
-
-| # | Optimization | Files touched | Expected win | Risk |
-|---|---|---|---|---|
-| 1 | **Mount a persistent host volume at `/root/.cache/huggingface/xet`** in the Harbor container so the bucket pull hits the local xet cache between sessions on the same machine. | `ors/server.py` (pass `mounts_json` via `TrialEnvironmentConfig`) | -5 to -25 s per session after first run | low |
-| 2 | **`force_build=False`** + share the Dockerfile across all tasks in a suite | already done (Stage 1's bucket-only Dockerfile is identical per task → image cached automatically) | one ~30 s build per suite, not per task | — |
-| 3 | **Sandbox pool** (pre-warm N idle containers, hand them out per session) | `ors/server.py` — wrap `EnvironmentFactory.create_environment_from_config` in a pool | -10 to -30 s cold-start per session | medium — need to reset kernel state between sessions |
-| 4 | **`hf-mount` lazy FUSE mount of the bucket** instead of `pull_bucket.py` upfront pull | `harbor/tasks/<base>/<id>/environment/Dockerfile` + `pull_bucket.py` | sub-second first-byte for big datasets; pays off when only a slice is read | medium — FUSE needs sandbox provider support; E2B + Modal yes, others varies |
-| 5 | **Parallel rollouts** in the eval driver (`rollouts/rollout_openai.py --n-concurrent K`) | new arg + `asyncio.gather` | K-x throughput up to OpenAI rate limit | low |
-| 6 | **Switch sandbox to E2B for batch runs** | `HARBOR_ENV_TYPE=e2b` env var, already wired | horizontal scale beyond one host | low — E2B template build is slow first time but cached after |
-| 7 | **Hosted ORS on HF Space** | new `ors/Dockerfile` + GHA | zero client-side setup; one URL anyone can hit | medium — HF Space resource limits |
-| 8 | **Cache the LLM-judge verdict** by `(gold, pred)` hash | small key-value file or sqlite | -1 API call when re-running same answers | trivial |
-| 9 | **Async OpenAI client + parallel tool-call dispatch** when model emits multiple tool calls in one turn | `rollouts/rollout_openai.py` | minor; rare in practice for these tasks | low |
-| 10 | **Multi-replica ORS server** behind nginx | infra, no code change | unbounded horizontal scale | high — production work |
-
-**Recommended order to actually do**: 1, 2 (already done), 8 (trivial), 5, then 3 or 6 depending on whether we lean local or cloud-first.
-
-## Benchmark roadmap — turning this into something publishable
-
-What we have today (`jupyter-agent-v1`, 10 tasks) is **a smoke test, not a benchmark**. To stand up a real benchmark:
-
-### 1. Scale the task set to N≥200
-
-10 tasks is statistically noisy. SWE-bench_Verified has 500. A reasonable target:
-
-- `--n-tasks 200` for a public eval set
-- `--n-tasks 1000` for a held-out training set (separate slug)
-- Two slugs: `--name eval-v1` (200 frozen) and `--name train-v1` (1000+)
-- The same `prepare/build_harbor_tasks.py` script we already have; just bump `--n-tasks` and run.
-
-### 2. Lock evaluation methodology
-
-A benchmark needs *fixed* answers to:
-
-- **Sampling**: deterministic seed already in place (`--seed 42`). Document the candidate filter (e.g., "executor_type=e2b, has non-null answer, dedup by `(kaggle, question)` keeping highest `edu_score`").
-- **Grader**: lock `grader.py` to the version that produces the leaderboard numbers. **Pin `gpt-4o-mini` as the judge** so judge drift doesn't move scores across leaderboard submissions.
-- **Agent / scaffold**: define one canonical reference agent (opencode + the JupyterToolAgent are good baselines).
-- **Sandbox**: pin `--env docker` or `--env e2b` so resource limits are equal across submissions.
-- **Pass@1 vs Pass@k**: pick one (start with pass@1; cheap to compute).
-
-### 3. Versioning
-
-- Tag everything: dataset slug + bucket + git commit. `jupyter-agent-eval-v1` is immutable once published.
-- Bucket is mutable, so use Xet `xet_hash` snapshots — record per-file hashes in `manifest.jsonl` so we can verify nothing drifted.
-
-### 4. Reporting layout
-
-Each submission produces a `jobs/` directory. Aggregate into a leaderboard row:
-
-```jsonl
-{"model":"openai/gpt-5","agent":"opencode","env":"docker","pass_at_1":0.40,"n_tasks":10,"timestamp":"…","cost_usd":0.587,"job_dir":"jobs/v1-opencode-gpt5"}
-```
-
-A tiny script: `scripts/leaderboard.py` reads multiple `jobs/*/result.json` files, emits leaderboard CSV + markdown.
-
-### 5. Distribution
-
-- HF Dataset repo (the spec repo, already done): the canonical task suite.
-- HF Bucket (the data, already done): the canonical files.
-- **HF Space** (new): an interactive leaderboard. Users submit `jobs/...` tarball; the Space scores and re-ranks. Or static markdown in the dataset repo README.
-- **Paper / blog**: methodology + baseline numbers.
-
-### 6. Sanity checks before calling it a benchmark
-
-- ≥ 200 tasks
-- ≥ 3 baseline models reported (e.g., gpt-4o-mini, gpt-5, claude-sonnet-4-5)
-- ≥ 2 baseline agents reported (opencode, JupyterToolAgent)
-- Grader determinism: re-run 1 task 10 times, same model, ensure reward is stable (or document the variance)
-- Cost transparency: report `cost_usd` per task
-
-## Concrete next 3 steps
-
-If you want to move toward a benchmark this week:
-
-1. **Generate `--name eval-v1 --n-tasks 200`** and push (Stage 1 already supports this; ~40 min build + bucket sync).
-2. **Run all 3 baselines** (opencode×gpt-4o-mini, opencode×gpt-5, JupyterToolAgent×gpt-5) on `eval-v1`. Cost rough estimate: 200 × $0.05 × 3 ≈ $30. Time: ~3 h with `-n 4` concurrent Harbor.
-3. **Write `scripts/leaderboard.py`** that aggregates `jobs/*/result.json` files into a single markdown table. Put the table in `eval-v1`'s Hub README.
-
-After that, the benchmark is live in a publishable form. Stage 4 (RL training against the env to *improve* pass-rate) is a separate effort.
-
----
-
-# Stage 2 — OpenReward server that delegates to Harbor (DONE — commit `00d4cdd`)
-
-End-to-end verified on the insurance task: reward 1.0, 7 turns, 40.8 s. Reference implementation lives at `rl/ors/server.py` + `rl/ors/list_tasks_helper.py` + `rl/ors/verdict.py` + `rl/rollouts/rollout_openai.py`. The notes below describe the design that was actually shipped.
-
-## The core idea (revised)
-
-Stage 1 already built the right sandbox abstraction: `harbor.environments.factory.create_environment(...)` understands our `task.toml` + `Dockerfile` + healthcheck-driven bucket pull, and works across `docker | e2b | modal | daytona | runloop | gke | apple-container`.
-
-**Stage 2 reuses that.** The OpenReward server is a thin shell that:
-1. Reads the same Harbor task folders.
-2. Asks Harbor's factory for a sandbox per session (`await env.start()` + `await env.run_healthcheck()`).
-3. Exposes 5 `@tool` methods that just `await env.exec(...)` against the Harbor-managed container.
-4. Grades `final_answer` inline via `grader.py` + a structured-output LLM judge.
-
-**Zero re-implementation of sandboxing.** Harbor handles Docker/E2B/Modal/healthcheck/bucket-pull/build. OpenReward handles HTTP protocol, sessions, per-call rewards. The 5 tools are the bridge.
-
-## Why this exists
-
-Stage 1 gives us **batch eval** (Harbor `run` over a static task suite). Stage 2 gives us **in-the-loop training**: each rollout is one session against a long-lived HTTP service that returns rewards per tool call. That's the shape TRL/SkyRL want.
-
-Two consumers of the same ORS server:
-1. **Direct rollout** (`rl/rollouts/`) — `openreward.EnvironmentsAPI` client + an LLM (OpenAI/Anthropic/our SFT model). Used for RL training rollouts and standalone debugging.
-2. **Harbor proxy agent** (`rl/harbor_agents/ors_proxy.py`, optional) — thin Harbor `BaseAgent` that talks to the ORS server instead of running a kernel inside the Harbor container. Lets Harbor batch eval reuse the ORS env without duplicating tool logic.
-
-The ORS server is one process. **Locally**: `python -m env.server` → `localhost:8080`, sandboxes spawned in E2B via the code-interpreter SDK. **Hosted (future)**: same code, push to HF Space, anyone hits it via `EnvironmentsAPI(base_url=...)`.
-
-## Goal — exact deliverables
-
-1. A working `python -m env.server` that exposes the 5 jupyter tools over the ORS HTTP protocol.
-2. Tasks loaded from our Harbor folders (`harbor/tasks/jupyter-agent-<slug>/`) — using `harbor.models.task.task.Task(task_dir)` to parse, not custom code.
-3. Per-session sandbox via `harbor.environments.factory.EnvironmentFactory.create_environment(...)` + `await env.start(force_build=False)` + `await env.run_healthcheck()`. Bucket pull happens inside the healthcheck, not in our code.
-4. Reward computed inline in `final_answer` via shared `rl/grader.py` + structured-output LLM judge (`AsyncOpenAI.beta.chat.completions.parse(response_format=Verdict)`).
-5. A standalone `rl/rollouts/rollout.py` that drives the env via `openreward.EnvironmentsAPI` + an OpenAI model. Verified by reproducing the 4/10 pass-rate from Stage 1 against `--name v1`.
-6. (Stretch) `rl/harbor_agents/ors_proxy.py` so Harbor eval can reuse the ORS env. Optional in this stage.
-
-## Architecture
-
-```
-   hf://datasets/<user>/<base>-harbor      hf://buckets/<user>/<base>-data
-   (spec, Stage 1)                         (data, Stage 1)
-                  │                            │
-                  └──────────────┬─────────────┘
-                                 │
-                                 ▼  imports
-        ┌────────────────────────────────────────────────────────┐
-        │  harbor.environments.factory.EnvironmentFactory        │
-        │    .create_environment(type=docker|e2b|…, …)           │
-        │    → BaseEnvironment with:                             │
-        │       async start(force_build)                         │
-        │       async run_healthcheck()    ← runs pull_bucket.py │
-        │       async exec(command, …)                           │
-        │       async upload_file(...)                           │
-        │       async stop(delete=True)                          │
-        └──────────────────┬─────────────────────────────────────┘
-                           │  composed inside →
-                           ▼
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  env/server.py  (openreward.environments.Server.run)            │
-   │                                                                 │
-   │   class JupyterAgentEnv(Environment):                           │
-   │     def __init__(self, task_spec, secrets):                     │
-   │       # parse task.toml via harbor.models.task.task.Task        │
-   │       # build TrialPaths + EnvironmentConfig                    │
-   │       # self._henv = EnvironmentFactory.create_environment(…)   │
-   │       # self.grader = AsyncOpenAI(api_key=secrets["OPENAI_…"])  │
-   │                                                                 │
-   │     async def setup(self):                                      │
-   │       await self._henv.start(force_build=False)                 │
-   │       await self._henv.run_healthcheck()   ← bucket lands here  │
-   │       await self._henv.upload_file(kernel_server.py, /opt/…)    │
-   │       await self._henv.exec("nohup python3 /opt/kernel_server.py &")
-   │                                                                 │
-   │     async def teardown(self):                                   │
-   │       await self._henv.stop(delete=True)                        │
-   │                                                                 │
-   │     @tool async def add_and_execute_code_cell(self, params):    │
-   │       r = await self._henv.exec("python3 /opt/run_cell.py …")   │
-   │       return ToolOutput(blocks=[…], reward=0.0, finished=False) │
-   │                                                                 │
-   │     @tool async def final_answer(self, params):                 │
-   │       # exact + numeric tiers from grader.grade(...)            │
-   │       # if miss → AsyncOpenAI.beta.chat.completions.parse(      │
-   │       #     response_format=Verdict, …)                         │
-   │       return ToolOutput(reward=r, finished=True)                │
-   │                                                                 │
-   │   Server([JupyterAgentEnv]).run(host=0.0.0.0, port=8080)        │
-   └─────────────────────────────────────────────────────────────────┘
-                         ▲
-                         │ HTTP (REST + SSE), openreward.EnvironmentsAPI
-                         │
-        ┌────────────────┴────────────────┬───────────────────────┐
-        │                                 │                       │
-   rollouts/rollout_openai.py    (stretch) harbor_agents/   (Stage 3) trl_grpo.py
-   - openreward client           ors_proxy.py               - reward_fn → ORS
-   - tool loop + LLM             - Harbor BaseAgent that      session.call_tool
-   - cumulative reward             talks to local ORS       - GRPO updates
-```
-
-## File layout (revised — leaner because Harbor does the sandbox work)
+Goal: at the top level of `rl/`, three obvious folders — **`data/`** (outputs), **`harbor/`** (specs + agents + run artifacts), **`scripts/`** (executable pipeline steps). Everything else gets archived.
 
 ```
 rl/
-├── env/                                ← NEW (this stage)
-│   ├── __init__.py
-│   ├── server.py                       ← JupyterAgentEnv + Server.run(); ~200 LOC
-│   ├── verdict.py                      ← Pydantic `Verdict(BaseModel)` for structured-output judge
-│   ├── README.md                       ← how to run + deploy notes
-│   └── (no e2b_sandbox.py, no notebook_tracker.py, no tasks_loader.py)
-│        ↑ Harbor's BaseEnvironment makes those redundant.
+├── PLAN.md                              # THIS file — the only active plan
+├── README.md                            # one-page quickstart pointing to PLAN.md
+├── pyproject.toml + uv.lock + .venv     # python deps
+├── .gitignore
 │
-├── rollouts/                           ← NEW (this stage)
-│   ├── __init__.py
-│   ├── rollout_openai.py               ← openreward.EnvironmentsAPI client + OpenAI tool loop
-│   └── rollout_anthropic.py            ← same shape, Anthropic tool-use API
+├── data/                                # all data outputs (gitignored except splits/)
+│   ├── raw/                             # HF dataset cache (current rl/cache/raw/)
+│   ├── classified.parquet               # Stage 1.1 output
+│   ├── splits/                          # Stage 1.2 outputs (committed to git)
+│   │   ├── eval_ids.txt                 # 1000 IDs
+│   │   ├── train_ids.txt                # ~28,500 IDs
+│   │   ├── eval_manifest.parquet
+│   │   ├── train_manifest.parquet
+│   │   └── splits.yaml                  # seed, strata, filter rules, hashes
+│   └── verification/                    # Stages 2 & 3 outputs
+│       ├── eval/
+│       │   ├── state.jsonl              # append-only event log (per-trial)
+│       │   ├── pass_at_k.parquet        # per (task,model): pass@1, pass@3
+│       │   ├── decisions.parquet        # final per-task verdict
+│       │   ├── gold_corrections.parquet # auto-corrected gold answers
+│       │   ├── verifiable_ids.txt       # final eval set
+│       │   ├── unverifiable_ids.txt     # dropped IDs + reasons
+│       │   ├── trials/                  # per-trial dirs (was rl/jobs/sweep-*/)
+│       │   ├── logs/                    # per-run stdout/stderr
+│       │   └── viz.html
+│       └── train/                       # same shape, Stage 3
 │
-└── harbor_agents/                       ← Stage 1 (already shipped)
-    ├── jupyter.py                      ← uses kernel_server.py too — shared infra
-    ├── kernel_server.py                ← SAME file uploaded into Harbor container by both runtimes
-    ├── run_cell.py                     ← SAME file
-    └── (stretch) ors_proxy.py           ← Harbor BaseAgent that proxies to localhost:8080 ORS
+├── harbor/                              # all Harbor-related
+│   ├── tasks/
+│   │   ├── data-agent-eval-v1/          # 1000 generated eval-pool tasks
+│   │   └── data-agent-train-v1/         # 28k+ train tasks (Stage 3)
+│   ├── agents/                          # renamed from harbor_agents/
+│   │   ├── _shared/                     # cost.py, providers.py
+│   │   ├── bash/
+│   │   ├── jupyter/
+│   │   └── seta/
+│   └── grader/                          # NEW: shared grader code that tasks reference
+│       ├── grader.py                    # multi-mode dispatcher (REWARD_MODE env)
+│       ├── modes.py                     # numeric / exact / list / judge implementations
+│       └── rubrics/                     # task-specific rubric YAMLs go here
+│
+└── scripts/                             # all pipeline scripts (was prepare/)
+    ├── 01_cache_dataset.py              # already exists, kept
+    ├── 02_classify.py                   # NEW
+    ├── 03_build_splits.py               # NEW
+    ├── 04_publish_splits.py             # NEW — pushes to HF Hub
+    ├── 05_build_tasks.py                # NEW (subsumes build_harbor_tasks.py)
+    ├── 06_verify_pool.py                # NEW — frontier sweep w/ pass@K
+    ├── 07_diagnose.py                   # NEW — recovery loop
+    ├── 08_visualize.py                  # was build_visualization.py
+    ├── fetch_kaggle.py                  # utility, kept
+    └── sweep.py                         # Qwen ladder, deferred to Stage 4
 ```
 
-**What is NOT duplicated:** `kernel_server.py`, `run_cell.py`, the Dockerfile, `pull_bucket.py`, `grader.py`. Stage 2 vendors all of these by importing or uploading from Stage 1's locations.
+Everything not in those four top-level dirs goes into:
 
-## Implementation order
+```
+rl/_archive/                             # never touched after move
+├── plans/
+│   ├── PLAN_v0.md                       # the old big plan
+│   ├── SWEEP_PLAN.md
+│   └── PIPELINE_PLAN.md                 # previous draft of this plan
+├── jupyter-agent-eval-v1/               # the frozen 100-task suite (was harbor/tasks/)
+├── jobs-v2/                             # the 1106-trial sweep-v2 run dirs
+├── cache-old/                           # old cache/{eval,sweep,hf-datasets} subdirs
+├── prepare-legacy/                      # one-shot scripts no longer used
+│   ├── build_eval_set.py
+│   ├── pick_three.py
+│   ├── replace_flagged.py
+│   ├── llm_audit.py
+│   └── stage_data.py
+├── rollouts/                            # the OpenAI/Anthropic rollout scripts from stage 2
+├── env/ + ors/                          # the OpenReward env experiment
+└── logs/                                # one-off log dumps
+```
 
-1. **Pin `harbor==0.6.6`** in `pyproject.toml` — Harbor doesn't declare API stability and we want a reproducible base.
+This restructure happens **once**, mechanically, before Stage 1 code lands. It's a `git mv` exercise.
 
-2. **Write `env/list_tasks_helper.py`** — walk `HARBOR_SUITE_DIR`, parse each `task.toml` via `harbor.models.task.task.Task(task_dir)`, return:
-   ```python
-   [{
-       "id": task_dir.name,
-       "task_dir": str(task_dir),
-       "instruction": (task_dir / "instruction.md").read_text(),
-       "gold_answer": t.config.verifier.env.get("EXPECTED_ANSWER"),
-       "question":    t.config.verifier.env.get("QUESTION"),
-   }, ...]
-   ```
+---
 
-3. **Write `env/verdict.py`** — Pydantic Verdict + Enum schema for the LLM-judge structured output:
-   ```python
-   from enum import Enum
-   from pydantic import BaseModel
-   class JudgeVerdict(str, Enum):
-       CORRECT = "CORRECT"; INCORRECT = "INCORRECT"; NOT_ATTEMPTED = "NOT_ATTEMPTED"
-   class JudgeOut(BaseModel):
-       verdict: JudgeVerdict
-       reasoning: str
-   ```
+## Stage 0 — Lock decisions
 
-3. **Write `env/server.py`** — `class JupyterAgentEnv(Environment)`. Mirror Harbor's `Trial.__init__`:
-   ```python
-   def __init__(self, task_spec, secrets):
-       super().__init__(task_spec)
-       task_dir = Path(task_spec["task_dir"])
-       self._task = Task(task_dir)                                          # parses task.toml
-       self._session_id = uuid.uuid4().hex[:12]                             # container-unique
+| Decision | Value | Rationale |
+|---|---|---|
+| Usable pool | e2b only (29,561 rows) | llm rows have broken Kaggle↔file metadata |
+| Eval pool size | 1,000 candidates | "Pool" — actual eval is whatever survives verification |
+| Train pool size | rest (~28,500) | One-shot verification at scale |
+| Eval stratification | (reward_mode × package_tier), max-K-per-Kaggle (K=4) | Diversity, no Kaggle dataset leakage |
+| Frontier models for eval | Sonnet 4.6, GPT-5.5, Opus 4.7 | 3 independent vendors for true consensus |
+| Frontier model for train | Sonnet 4.6 (+ GPT-5.5 on failure) | Cheaper, single-pass |
+| Verification harness | `seta` (highest pass rate from v2) | One harness keeps cost predictable |
+| Pass@K | K=3 for eval, K=1 for train | Eval is exhaustive, train is one-shot |
+| Verifiability rule | ≥2 of 3 frontier models hit pass@K ≥ 1 | Robust to one model's blind spots |
+| Gold auto-correction | Enabled (see Stage 2.5) | Handles "the gold answer might be wrong" |
+| RL training reward | `flexible` (outcome-only) | Avoids PRM-exploitation pathology |
+| HF Hub dataset | `AdithyaSK/data_agent_rl` (private to start) | Source of truth for IDs |
 
-       # Per-session scratch dir (Harbor bind-mounts subdirs of this)
-       trial_dir = Path(tempfile.mkdtemp(prefix=f"ors-{self._session_id}-"))
-       self._trial_paths = TrialPaths(trial_dir=trial_dir)
-       self._trial_paths.mkdir()                                            # ← REQUIRED
+---
 
-       # Mirror Trial.__init__ exactly
-       self._henv = EnvironmentFactory.create_environment_from_config(
-           config=self._task.config.environment,
-           environment_dir=task_dir / "environment",
-           environment_name=f"ors-{task_spec['id']}-{self._session_id[:8]}",
-           session_id=self._session_id,
-           trial_paths=self._trial_paths,
-           task_env_config=self._task.config.environment,
-           logger=logging.getLogger(__name__),
-       )
+## Stage 1 — Splits and Hub publishing
 
-       self.grader_client = AsyncOpenAI(api_key=secrets["OPENAI_API_KEY"])
-       self._kernel_started = False
+### 1.1 Classify all 29,561 rows (`scripts/02_classify.py`)
 
-   @classmethod
-   def list_splits(cls):
-       return [Split(name="train"), Split(name="eval")]
+Inputs: `data/raw/thinking.parquet` (we ignore non_thinking; answers are 100% identical).
 
-   @classmethod
-   def list_tasks(cls, split):
-       suite_dir = Path(os.environ["HARBOR_SUITE_DIR"])
-       return [...read each task_dir...]                                    # see step 2
+For each row, attach:
+- `reward_mode_initial` ∈ {`numeric`, `exact_short`, `exact_bool`, `list`, `list_csv`, `flexible`, `llm_judge_long`, `missing`} — deterministic rules (same as the prototype we ran).
+- `answer_norm` — strip `%`, parentheticals, trailing units.
+- `q_word_count`, `answer_len`, `n_files`, `n_packages`.
+- `package_tier`: `0` (pandas/numpy/matplotlib only), `1` (+ sklearn/scipy/seaborn), `2` (deep-learning), `3` (other).
+- `kaggle_dataset_name` — passthrough, used for stratification.
 
-   def get_prompt(self):
-       return [TextBlock(text=self.task_spec["instruction"])]
+Output: `data/classified.parquet` (~29,561 rows × ~20 cols).
 
-   async def setup(self):
-       await self._henv.start(force_build=False)
-       await self._henv.run_healthcheck()                                   # bucket lands HERE
-       if self._henv.capabilities.mounted:
-           self._trial_paths.chmod_dir()                                    # ← REQUIRED if mounted
-       await self._henv.upload_file(KERNEL_SERVER_PATH, "/opt/kernel_server.py")
-       await self._henv.upload_file(RUN_CELL_PATH, "/opt/run_cell.py")
-       await self._henv.exec("nohup setsid python3 /opt/kernel_server.py >/tmp/k.log 2>&1 &")
-       # poll http://127.0.0.1:8765/ until 200
-       self._kernel_started = True
+### 1.2 Sample splits (`scripts/03_build_splits.py`)
 
-   async def teardown(self):
-       await self._henv.stop(delete=True)
-       shutil.rmtree(self._trial_paths.trial_dir, ignore_errors=True)
-   ```
-   Then 5 `@tool async def` methods (canonical pattern documented in `using-llm-graders`).
+Algorithm:
+1. Drop classifier output rows where `reward_mode_initial == missing`.
+2. Stratify by `(reward_mode_initial, package_tier)`.
+3. Within each stratum, sort by Kaggle dataset name, cap at **K=4 rows per Kaggle dataset** in eval.
+4. Sample 1,000 eval IDs proportional to natural distribution (≈45% numeric, 27% exact, 23% flexible, etc.).
+5. Train pool = `classified_pool \ eval_pool`, with `K=8` cap per Kaggle for diversity.
 
-4. **Tool implementations**:
-   ```python
-   @tool
-   async def add_and_execute_code_cell(self, params: CodeCellParams) -> ToolOutput:
-       b64 = base64.b64encode(params.code.encode()).decode()
-       r = await self._henv.exec(f"python3 /opt/run_cell.py --code-b64 {b64}", timeout_sec=180)
-       payload = json.loads(r.stdout or '{"output":"","ok":false}')
-       return ToolOutput(blocks=[TextBlock(text=payload["output"])], reward=0.0, finished=False)
+Outputs:
+```
+data/splits/
+├── eval_ids.txt           # 1000 lines
+├── train_ids.txt          # ~28,500 lines
+├── eval_manifest.parquet  # full row data + classifier output for eval
+├── train_manifest.parquet
+└── splits.yaml            # seed=42, strata config, content hashes
+```
 
-   @tool
-   async def final_answer(self, params: FinalAnswerParams) -> ToolOutput:
-       # Tier 1+2: deterministic
-       res = grade(self.task_spec["gold_answer"], params.answer, judge=False)
-       if res.reward == 0.0 and self.task_spec.get("question"):
-           # Tier 3: structured-output LLM judge
-           resp = await self.grader_client.beta.chat.completions.parse(
-               model="gpt-4o-mini",
-               messages=[{"role": "user", "content": JUDGE_PROMPT.format(
-                   question=self.task_spec["question"],
-                   gold=self.task_spec["gold_answer"],
-                   pred=params.answer,
-               )}],
-               response_format=JudgeOut,                                    # Pydantic schema
-               temperature=0,
-           )
-           verdict = resp.choices[0].message.parsed.verdict
-           reward = 1.0 if verdict == JudgeVerdict.CORRECT else 0.0
-       else:
-           reward = res.reward
-       return ToolOutput(blocks=[TextBlock(text="ok")], reward=reward, finished=True)
-   ```
+### 1.3 Publish to HF Hub (`scripts/04_publish_splits.py`)
 
-5. **Smoke-test the server**: `HARBOR_SUITE_DIR=harbor/tasks/jupyter-agent-v1 python -m env.server &` then `curl http://localhost:8080/list_environments` → should return `["jupyteragentenv"]`. Then `curl /environments/jupyteragentenv/tasks/train`.
+Create a new private HF dataset `AdithyaSK/data_agent_rl` with two configs (splits):
+- `eval` — 1000 rows from `eval_manifest.parquet`
+- `train` — ~28,500 rows from `train_manifest.parquet`
 
-6. **Write `rl/rollouts/rollout_openai.py`** — modeled on `references/RL_Envs_101/envs/jupyter_env/ors/rollout.py`:
-   - args: `--task-id` or `--task-index`, `--model`, `--max-turns`
-   - reads `ORS_URL` (default `http://localhost:8080`), `ORS_ENV_NAME` (default `jupyteragentenv`)
-   - opens `with env.session(task=task, secrets={"OPENAI_API_KEY": ...}) as s`
-   - multi-turn OpenAI tool-calling loop using `s.call_tool(name, args)`
-   - prints cumulative reward + final answer
+Per-row schema:
+```
+id                    str
+question              str
+answer                str (original gold)
+answer_norm           str (classifier-normalized)
+kaggle_dataset_name   str
+files_used            list[str]
+packages_used         list[str]
+edu_score             int
+executor_type         str ("e2b")
+reward_mode_initial   str
+package_tier          int
+# verification columns added in Stage 2 (republished):
+verifiable            bool       # None on first push, True/False after verify
+reward_mode_final     str        # the mode the verifier ended up using
+gold_corrected        bool       # True if frontier consensus overrode the gold
+gold_original         str        # original gold (only set when gold_corrected=True)
+pass_rate             float      # pass@K across all frontier rollouts
+```
 
-7. **Verify reward parity with Stage 1** — run `rollouts/rollout_openai.py --task-id 0082_302_82302927_qa_3 --model openai/gpt-5`. Must produce `reward=1.0` and a predicted value in the same numeric band (~0.749x) as Stage 1's Harbor run. Exact match impossible (LLM stochasticity even at temperature=0), pass-rate parity is the right check.
+Also upload `splits.yaml` and a `README.md` describing the dataset, classifier rules, and verification methodology.
 
-8. **(Stretch) `harbor_agents/ors_proxy.py`** — Harbor `BaseAgent` that opens an `EnvironmentsAPI` session against `localhost:8080` and proxies tool calls. Reuses the Stage 1 task suite + verifier. Pure thin shim (~80 LOC).
-
-9. **(Future) Push the ORS env to HF Spaces** — `env/Dockerfile` + GHA workflow. Mirror `references/RL_Envs_101/envs/jupyter_env/ors/` (deployed at `AdithyaSK/jupyter-agent-ors`). Then anyone runs `EnvironmentsAPI(base_url="https://<user>-jupyter-agent.hf.space")`.
-
-## Locked decisions
-
-| | |
-|--|--|
-| **Tools** | Exactly the 5 from `references/RL_Envs_101/envs/jupyter_env/ors/server.py` and `harbor_agents/jupyter.py`. Same names, same input schemas. |
-| **Reward shape** | `final_answer` returns `ToolOutput(reward=grader_result, finished=True)`. Other tools return `reward=0.0, finished=False`. No per-call shaping in v1; revisit when training. |
-| **Sandbox backend** | **`harbor.environments.factory.EnvironmentFactory.create_environment(...)` — same code-path as `harbor run`.** No re-implementation. Sandbox type picked via `HARBOR_ENV_TYPE` env var (`docker | e2b | modal | …`). |
-| **Bucket pull** | Via Harbor's `[environment.healthcheck]` calling `pull_bucket.py` — explicitly invoked with `await self._henv.run_healthcheck()`. Same script Stage 1 ships. |
-| **Kernel** | `harbor_agents/kernel_server.py` uploaded into the Harbor container at session setup. Stateful Python via persistent globals over HTTP. Shared infra with `JupyterToolAgent`. |
-| **Task source** | `harbor/tasks/jupyter-agent-<slug>/` folders on disk. `HARBOR_SUITE_DIR` env var controls the slug. Parsed via `harbor.models.task.task.Task(task_dir)`. |
-| **Grader** | `rl/grader.py` shared with Stage 1's `tests/grader.py`. Exact + numeric tiers same. **LLM-judge tier upgraded to structured output via `AsyncOpenAI.beta.chat.completions.parse(response_format=JudgeOut)`** — no regex. |
-| **Secrets** | OpenReward injects per-session via the `secrets` dict in `Environment.__init__`. Client side passes `secrets={"OPENAI_API_KEY": ..., "HF_TOKEN": ..., "E2B_API_KEY": ...}` when opening a session. |
-| **Async** | All Harbor I/O is async (`start`, `stop`, `exec`, `upload_file`, `run_healthcheck`). Our `@tool` methods are `async def` accordingly. |
-| **Harbor version** | `harbor==0.6.6` pinned. No declared API stability — bump deliberately, not auto. |
-
-## What this unlocks once shipped
-
-- **TRL/SkyRL training** — point the trainer at the ORS HTTP endpoint, treat each rollout as one episode against the env. Per-call rewards mean GRPO/PPO can shape behavior across tool calls, not just on the final answer.
-- **Cross-platform eval** — same 5-tool surface as Harbor + the JupyterToolAgent. Numbers from `rollout_openai.py` (ORS) and `harbor run -a opencode` (Harbor) should match on the same task + model + grader, since they share `grader.py`.
-- **Public env** — push the ORS server to HF Spaces and the eval becomes a single-URL service anyone can run rollouts against. (Out of scope this stage, but the design is the same.)
-
-## Risks called out by research
-
-These came out of the audit pass against `openrewardstandard/python-sdk` and `harbor-framework/harbor` source:
-
-1. **No public adapter exists.** OpenReward's "Harbor mode" is a closed-source server-side feature on openreward.ai. We are writing the first public `Environment` subclass that imports `harbor.environments`. Building blocks are all public.
-2. **Healthcheck is not auto-run by `start()`.** Easy to miss. Must explicitly `await env.run_healthcheck()` after `start()`, otherwise the agent runs before `pull_bucket.py` lands files.
-3. **`TrialPaths` requires side-effects.** `TrialPaths(trial_dir=...)` is a frozen dataclass with only `trial_dir` required, BUT you MUST call:
-   - `trial_paths.mkdir()` — creates `agent/`, `verifier/`, `artifacts/` subdirs (Docker bind-mounts fail without them).
-   - `trial_paths.chmod_dir()` — only if `env.capabilities.mounted` is True (non-root users need to write to mounted dirs).
-4. **`environment_dir` must already contain the Dockerfile + healthcheck files**. Use `task_dir/"environment"` from our Stage 1 layout — Harbor doesn't synthesize.
-5. **`session_id` must be unique per concurrent session** — used as the container name. Generate via `uuid.uuid4().hex[:12]` per session.
-6. **Use `EnvironmentFactory.create_environment_from_config`, not the raw `create_environment`** — `Trial.__init__` (Harbor's own caller) uses the `_from_config` variant. Mirror it exactly.
-7. **All Harbor methods are async** — `@tool async def`, `await env.exec(...)`. OpenReward's `@tool` decorator transparently handles both sync and async via `await maybe_await(fn(inp))` (verified in `src/ors/environment.py`).
-8. **Harbor version drift.** Pin `harbor==0.6.6`. Their pydantic models for `EnvironmentConfig` / `Task` / `TrialPaths` may break on minor releases.
-9. **Reference repo `references/RL_Envs_101/envs/jupyter_env/ors/` uses the E2B Code Interpreter SDK directly.** We're *not* following that path — Harbor's factory abstracts E2B, Docker, Modal, Daytona behind one interface. Reference is for tool-shape only.
-
-## The Trial.__init__ pattern we mirror
-
-Verbatim from `harbor.trial.trial.Trial.__init__` (the canonical Harbor caller for `EnvironmentFactory`):
-
+**Usage from anywhere:**
 ```python
-# Harbor's own code — this is what `harbor run` does internally
-self._trial_paths = TrialPaths(trial_dir=self.trial_dir)
-self._trial_paths.mkdir()
-
-self._environment = EnvironmentFactory.create_environment_from_config(
-    config=config.environment,                       # trial-level EnvironmentConfig
-    environment_dir=self._task.paths.environment_dir,  # <task_dir>/environment/
-    environment_name=self._task.name,                # used as container name
-    session_id=self.config.trial_name,               # unique per trial
-    trial_paths=self._trial_paths,
-    task_env_config=self._task.config.environment,   # the [environment] block from task.toml
-    logger=self._logger,
-)
-
-if self._environment.capabilities.mounted:
-    self._trial_paths.chmod_dir()
+from datasets import load_dataset
+eval = load_dataset("AdithyaSK/data_agent_rl", split="eval")
 ```
 
-Our `env/server.py` does exactly this inside `Environment.__init__`. Plus `await self._henv.start(force_build=False)` + `await self._henv.run_healthcheck()` in `setup()`.
+Republished after Stage 2 (with verification columns populated) and again after Stage 3.
 
-## Open questions
+---
 
-1. **Single ORS server per slug, or one server multiplexing all slugs?** Simplest: one server, slug selected by `HARBOR_SUITE_DIR` at startup. If we want a permanent service, multiplex via the `Split` API (`v1-train`, `v1-eval`, `v2-train`, ...).
-2. **Sandbox type at runtime: `docker` or `e2b`?** Both work via `HARBOR_ENV_TYPE`. **Default: `docker`** for local dev (fast cold-start, free); **deploy mode: `e2b`** (scales horizontally for many parallel rollouts).
-3. **One sandbox per session, or sandbox pool?** Per-session is simplest; pool is the optimization once we hit RL rollout throughput. Start per-session.
-4. **Hosted deploy now or later?** Local-only first. Hosted is a 2-file diff (`Dockerfile` + GHA workflow) once the local server works.
+## Stage 2 — Verification pipeline (iterate on the 1000 eval pool)
 
-## Sources
+### 2.1 Multi-mode grader (`harbor/grader/grader.py`)
 
-- [Deploying Harbor Environments — OpenReward](https://docs.openreward.ai/environments/deploying-harbor-environments)
-- [Using LLM Graders — OpenReward](https://docs.openreward.ai/environments/using-llm-graders)
-- [Your First Environment — OpenReward](https://docs.openreward.ai/environments/your-first-environment)
-- [Harbor source — github.com/harbor-framework/harbor](https://github.com/harbor-framework/harbor)
-- [`harbor==0.6.6` on PyPI](https://pypi.org/project/harbor/)
-- [`openreward==0.1.81` on PyPI](https://pypi.org/project/openreward/)
-- [Reference repo: RL_Envs_101 jupyter_env/ors](https://github.com/adithya-s-k/RL_Envs_101/tree/main/envs/jupyter_env/ors)
+One file dispatches on `REWARD_MODE` env var:
+
+| Mode | Implementation |
+|---|---|
+| `exact` / `exact_short` | case-insensitive string equality |
+| `exact_bool` | normalize to bool, compare |
+| `numeric` | parse both as float, return 1.0 if `|p−g| ≤ atol` or `|p−g|/|g| ≤ rtol` |
+| `list` | parse as Python literal, set/order compare |
+| `list_csv` | split on commas, set compare |
+| `flexible` | exact → numeric → llm-judge fallback (eval-v1 behavior) |
+| `llm-judge` | one GPT-4o-mini call: "is `pred` equivalent to `gold`?" |
+| `vote-judge` | 3-vote majority judge |
+| `rubric` | per-task `rubric.yaml`, weighted-sum of per-criterion judge calls |
+| `hybrid` | `0.7 * flexible + 0.3 * rubric` |
+
+Outputs:
+- `/logs/verifier/reward.txt` — scalar (Harbor's required signal)
+- `/logs/verifier/reward.json` — `{reward, mode, components, judge_calls, predicted, gold}` for analysis
+
+### 2.2 Build Harbor task specs (`scripts/05_build_tasks.py`)
+
+For each ID in `eval_ids.txt`:
+- Read row from `eval_manifest.parquet`.
+- Generate `harbor/tasks/data-agent-eval-v1/<id>/`:
+  - `task.toml` with `[verifier.env]` set from classifier:
+    ```toml
+    [verifier.env]
+    REWARD_MODE = "numeric"
+    EXPECTED_ANSWER = "{answer}"
+    EXPECTED_ANSWER_NORM = "{answer_norm}"
+    ANSWER_TYPE = "numeric"
+    QUESTION = "{question}"
+    ATOL = "0.001"
+    RTOL = "0.01"
+    JUDGE_MODEL = "openai/gpt-4o-mini"
+    OPENAI_API_KEY = "${OPENAI_API_KEY}"
+    ```
+  - `instruction.md` — reused from the eval-v1 template (same prompt the SFT model saw).
+  - `tests/test.sh` — invokes `harbor/grader/grader.py` (mounted at runtime).
+  - `environment/Dockerfile` + `pull_bucket.py` — unchanged.
+  - `rubric.yaml` only when classifier picks `rubric` mode.
+
+Parallel generation with `ThreadPoolExecutor` — ~1000 folders in <60s.
+
+### 2.3 Frontier verification with pass@K (`scripts/06_verify_pool.py`)
+
+For each task in `data-agent-eval-v1`:
+- For each model in `[sonnet-4-6, gpt-5.5, opus-4-7]`:
+  - For `k in 1..3`: run 1 trial with `seta-tool` harness.
+- 9 trials per task × 1,000 tasks = **9,000 trials, ~$270 estimated**.
+
+State written append-only to `data/verification/eval/state.jsonl`:
+```jsonc
+{"ts":"...","event":"finish","task_id":"...","model":"sonnet-4-6","k":1,
+ "reward":1.0,"cost_usd":0.03,"prompt_tokens":12000,"completion_tokens":800,
+ "predicted_answer":"645","error_kind":"ok"}
+```
+
+After all trials, compute per (task, model):
+- `pass@1` = trial 1 passed (reward ≥ 1)
+- `pass@3` = any of 3 trials passed
+- And per task: how many distinct models hit pass@3.
+
+### 2.4 Verifiability decision (per task)
+
+After the sweep:
+- **Verifiable**: ≥2 of 3 frontier models hit pass@3 ≥ 1 under the *classifier-assigned* mode.
+- **Borderline**: exactly 1 of 3 hits pass@3.
+- **Unverifiable**: 0 of 3 hit pass@3.
+
+### 2.5 Recovery loop (`scripts/07_diagnose.py`) — three paths
+
+For Borderline / Unverifiable tasks, **before dropping**, try three paths in order:
+
+**Path A: Grader-too-strict → escalate mode.**
+- Read each failed trial's predicted answer from `state.jsonl`.
+- Re-grade with progressively looser modes: current → `flexible` → `llm-judge` → `vote-judge`.
+- If a looser mode finds at least 2 frontier models passing, **promote the mode** in `task.toml` and mark verifiable. Log `mode_upgrade` event.
+
+**Path B: Gold answer wrong → frontier consensus auto-correction.**
+- If all 3 frontier models *agree with each other* but disagree with the gold (all 3 produce the same alternative answer across pass@3), this is strong evidence the gold is wrong.
+- Auto-replace `EXPECTED_ANSWER` in `task.toml` with the frontier-consensus answer, set `gold_corrected=True`, save `gold_original` to the manifest.
+- Re-grade existing trials against the new gold. If now verifiable, keep with `gold_corrected=True` flag.
+- *Conservative threshold*: require all 3 frontier models AND ≥2/3 trials per model to give the same alt-answer (so 6+ identical alt-answers).
+
+**Path C: Task is genuinely broken → drop with reason.**
+- Run a one-shot LLM diagnostic (1 GPT-4o-mini call, ~$0.0005 each):
+  ```
+  Categorize: {
+    ambiguous_question, dataset_mismatch, unreachable_answer,
+    code_runtime_error, kaggle_unreachable, genuinely_hard
+  }
+  ```
+- Drop and log reason to `unverifiable_ids.txt`.
+
+Outcomes are appended to `decisions.parquet` and the manifest:
+
+```
+decisions.parquet
+├── task_id
+├── verdict          ∈ {verifiable, verifiable_after_upgrade, verifiable_gold_corrected, dropped}
+├── reward_mode_final
+├── gold_corrected   (bool)
+├── gold_original    (only set when gold_corrected)
+├── frontier_pass    (count of frontier models passing)
+└── drop_reason      (one of the LLM-diag categories; only set when dropped)
+```
+
+### 2.6 Visualization (`scripts/08_visualize.py`)
+
+Reuse the existing `build_visualization.py` but pointed at `data/verification/eval/state.jsonl`. Adds two new views over the v2 dashboard:
+- "Gold corrections" — table of tasks where frontier overrode the gold answer, sortable, with original vs new gold.
+- "Drop reasons" — pie/bar of drop categories.
+
+### 2.7 Stage-2 outputs
+
+```
+data/verification/eval/
+├── state.jsonl
+├── pass_at_k.parquet
+├── decisions.parquet
+├── gold_corrections.parquet
+├── verifiable_ids.txt              # subset of 1000 — the actual eval set
+├── unverifiable_ids.txt
+├── trials/<task>__<rand>/...       # per-trial Harbor artifacts
+├── logs/                           # per-sweep stdout/stderr
+└── viz.html
+```
+
+Republish `AdithyaSK/data_agent_rl` with verification columns populated for the eval split.
+
+---
+
+## Stage 3 — Scale to train (~28.5k)
+
+Same pipeline, cheaper config:
+- **1 model × pass@1** (Sonnet 4.6 only).
+- On failure, retry once with GPT-5.5.
+- Skip the diagnosis loop — just drop failures with their pass/fail status.
+- No gold auto-correction at this scale (it requires multi-model consensus; we only run 1-2 models).
+
+Estimated cost: ~$700-1,000 for the 28.5k.
+
+Outputs mirror `data/verification/eval/` shape under `data/verification/train/`.
+
+Republish `AdithyaSK/data_agent_rl` with verification columns populated for the train split.
+
+---
+
+## Stage 4 — Difficulty bucketing (deferred)
+
+Once the verifiable pool exists, run the Qwen ladder sweep (`scripts/sweep.py`, the existing v2 code) on the verifiable eval to attach easy/medium/hard. Not blocking for the rest of the pipeline.
+
+---
+
+## Ablations (post-hoc analysis on Stage 2 results)
+
+All recompute from `state.jsonl` — no extra rollouts:
+
+| Ablation | What it answers |
+|---|---|
+| pass@1 vs pass@3 vs pass@5 | Marginal benefit of more rollouts |
+| 1 frontier model vs 2 vs 3 | Is Opus worth the cost vs Sonnet alone |
+| Grader mode (strict→loose) | False-positive / false-negative rate of each mode |
+| Cross-harness re-grade | Re-grade seta trajectories against bash/jupy graders to confirm verifiability isn't harness-biased |
+| Gold-correction rate by category | What % of verifiable tasks needed correction |
+
+One opt-in extra rollout: **rerun verify_pool with `jupy` harness** to confirm verifiability isn't seta-specific.
+
+---
+
+## Verification criteria for "pipeline works" (gate before Stage 3)
+
+1. **Verifiable rate ≥ 70%** of the 1000 eval pool (including post-correction). Lower → classifier or grader needs work.
+2. **Mode-upgrade rate ≤ 15%**. Higher → classifier rules need refining.
+3. **Gold-correction rate ≤ 10%** (sanity — if we're "correcting" >10% of gold answers, something's off; either our threshold is too loose or the dataset is more broken than we thought).
+4. **Per-frontier pass-rate gap ≤ 20pp**. Outlier model = integration issue.
+5. **Drop-reason distribution looks plausible.** Most drops should be `ambiguous_question` or `code_runtime_error`. Anomalies trigger investigation.
+
+---
+
+## Cost ballpark
+
+| Stage | Trials | $/trial | Total |
+|---|---|---|---|
+| Stage 1 (sample + publish) | 0 | — | $0 |
+| Stage 2 (1000 × 3 models × pass@3, seta) | 9,000 | $0.03 | **~$270** |
+| Stage 2 LLM diagnosis | ~300 calls | $0.0005 | < $0.50 |
+| Stage 3 (28.5k × 1-1.5 models × pass@1, seta) | ~42,000 | $0.025 | **~$1,050** |
+| Stage 4 (Qwen ladder, deferred) | — | — | — |
+| **Total** | | | **~$1,300** |
+
+---
+
+## Concrete execution order
+
+### Pre-work (do once)
+
+0. **Restructure**: move legacy stuff to `_archive/`, rename `harbor_agents/` → `harbor/agents/`, `prepare/` → `scripts/`. Single PR. Update import paths.
+
+### Stage 1 (sample + publish)
+
+1. `scripts/02_classify.py` — classify 29,561 rows → `data/classified.parquet`.
+2. `scripts/03_build_splits.py` — sample 1000 eval + 28.5k train → `data/splits/`.
+3. `scripts/04_publish_splits.py` — push to `AdithyaSK/data_agent_rl` on HF Hub.
+
+### Stage 2 (verify the eval pool — iterate here)
+
+4. `harbor/grader/grader.py` + `modes.py` — implement multi-mode dispatcher. Unit tests with hand-picked rows for each mode.
+5. `scripts/05_build_tasks.py` — generate `harbor/tasks/data-agent-eval-v1/` (1000 task folders).
+6. `scripts/06_verify_pool.py` — pilot run on 50 tasks first; check artifacts; then full 1000.
+7. `scripts/07_diagnose.py` — run on borderline/unverifiable.
+8. `scripts/08_visualize.py` — generate dashboard.
+9. **REVIEW gate**: check the 5 criteria above. Iterate on classifier/grader/generator until pass.
+10. Republish HF dataset with verification columns.
+
+### Stage 3 (scale to train)
+
+11. `scripts/06_verify_pool.py --pool train --models sonnet-4-6 --k 1` on the 28.5k.
+12. Republish HF dataset with train-split verification columns.
+
+### Stage 4 (deferred)
+
+13. Difficulty bucketing via Qwen ladder, only if we want a stratified eval card.
+
+---
+
+## What this plan does NOT cover
+
+- **RL training itself.** Producing the task suite only. Training is a separate plan.
+- **Process reward (PRM).** Listed as a `REWARD_MODE` but not used in verification. Reserved for a future ablation.
+- **Recovering the 21k llm-executor rows.** Discarded; not worth the engineering cost.
+- **Cross-language tasks.** Everything assumes Python + standard data-science stack.
