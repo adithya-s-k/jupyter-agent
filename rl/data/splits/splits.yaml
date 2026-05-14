@@ -1,0 +1,35 @@
+version: data_agent_rl_v1
+seed: 42
+eval_size_target: 1000
+eval_size_actual: 1000
+train_size_actual: 28555
+eval_k_per_kaggle: 4
+train_k_per_kaggle: 0
+stratification: (reward_mode_initial, package_tier)
+classifier_input_sha256_16: 88d32b480096bb05
+eval_ids_sha256_16: 8f4a0a27066a2ace
+train_ids_sha256_16: aece3b9fafb58a3d
+reward_mode_distribution_eval:
+  numeric: 454
+  exact_short: 264
+  flexible: 231
+  exact_bool: 23
+  list_csv: 15
+  list: 7
+  llm_judge_long: 6
+reward_mode_distribution_train:
+  numeric: 12949
+  exact_short: 7557
+  flexible: 6606
+  exact_bool: 653
+  list_csv: 420
+  list: 200
+  llm_judge_long: 170
+package_tier_distribution_eval:
+  1: 736
+  2: 169
+  0: 63
+  3: 32
+kaggle_unique_eval: 325
+kaggle_unique_train: 790
+kaggle_shared: 324

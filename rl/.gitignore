@@ -3,13 +3,19 @@
 # NOTE: gitignore does NOT support inline `#` comments — comments must be on
 # their own line, otherwise the trailing text becomes part of the pattern.
 
-# ── Heavy / generated artifacts ───────────────────────────────────────────
-# Source dataset cache (~163 GB) + HF datasets/xet caches.
-cache/
+# ── Data: heavy raw cache + generated artifacts ───────────────────────────
+# Source dataset parquets (~70 GB).
+data/raw/
+# Classifier output (~few MB, regenerable from raw).
+data/classified.parquet
+# Stage-2/3 verification outputs (state.jsonl, trials/, etc.).
+data/verification/
+# data/splits/ IS committed — those IDs are the source of truth.
+# Override the top-level *.parquet ignore for the split manifests only.
+!data/splits/*.parquet
 
-# Generated Harbor task suites. Canonical home is the HF Hub dataset repo
-# `<user>/jupyter-agent-<slug>-harbor`. Always regeneratable via
-# `prepare/build_harbor_tasks.py --name <slug>`.
+# Generated Harbor task suites. Canonical home is the HF Hub dataset repo.
+# Always regenerable via scripts/05_build_tasks.py (or legacy build_harbor_tasks.py).
 harbor/tasks/
 
 # `harbor run` job outputs (per-trial logs, configs, results).
@@ -17,6 +23,13 @@ jobs/
 
 # Local harbor run logs we tee to files.
 logs/
+
+# ── Legacy archive: keep code in git, exclude heavy / regenerable blobs ───
+_archive/cache-eval/
+_archive/cache-sweep/
+_archive/cache-misc/
+_archive/jobs-v2/
+_archive/logs/
 
 # ── Tooling junk ──────────────────────────────────────────────────────────
 .kaggle/
