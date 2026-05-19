@@ -85,13 +85,14 @@ kaggle_dataset_name = "{kaggle}"
 gold_answer = "{answer_esc}"
 reward_mode_initial = "{reward_mode}"
 package_tier = {package_tier}
+difficulty_level = 0
 
 [environment]
 build_timeout_sec = 600.0
 os = "linux"
-cpus = 2
-memory_mb = 4096
-storage_mb = 10240
+cpus = 1
+memory_mb = 1024
+storage_mb = 5120
 gpus = 0
 allow_internet = true
 mcp_servers = []

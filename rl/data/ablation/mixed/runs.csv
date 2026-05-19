@@ -1,0 +1,2 @@
+run_id,started_at,ended_at,n_tasks_attempted,n_verified,total_cost_usd
+20260514T185622Z,2026-05-14T18:56:22.040569+00:00,2026-05-14T19:17:56.843655+00:00,30,20,4.532963

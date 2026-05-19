@@ -36,6 +36,11 @@ class RunConfig:
 
     # Allowed doctor probe aliases (None = all aliases in doctor.ALLOWED_PROBE_MODELS)
     probe_aliases: list[str] | None = None
+    # Per-probe wall-time cap (seconds). Probes run a full Phase-B-style trial
+    # via harbor; capping this at 180s kills the long-tail outliers without
+    # losing most rescues. Independent of cfg.subprocess_timeout_sec, which
+    # governs the anchor's own Phase B trials.
+    probe_timeout_sec: int = 180
     # LLM used by Phase B regrade's llm-judge fallback
     regrade_judge_model: str = "openai/gpt-5.4-nano"
 
@@ -223,6 +228,7 @@ def process_task(row: Mapping, cfg: RunConfig) -> dict:
             model=cfg.doctor_model,
             sandbox=cfg.sandbox,
             subprocess_timeout_sec=cfg.subprocess_timeout_sec,
+            probe_timeout_sec=cfg.probe_timeout_sec,
             budget_remaining_fn=_budget_left,
             probe_aliases=cfg.probe_aliases,
         )
@@ -254,6 +260,11 @@ def process_task(row: Mapping, cfg: RunConfig) -> dict:
             # Doctor confirmed cross-model consensus on the gold; mark verified.
             passing_round = "C-judge"
             passing_predicted = "(cross-model consensus)"
+            # Use the last failing Phase B trial as the trajectory input for
+            # categorize. The trajectory drives difficulty assessment; the
+            # answer itself is supplied by gold + cross-model consensus.
+            if b["trials"]:
+                passing_trial_dir = b["trials"][-1].trial_dir
 
     # Decide final verdict
     if passing_predicted and (
@@ -301,7 +312,8 @@ def process_task(row: Mapping, cfg: RunConfig) -> dict:
     diff_reasoning = ""
     diff_signal = ""
     empirical_easy = None
-    if final_verdict.startswith("verified") and cfg.enable_categorize and passing_trial_dir:
+    if (final_verdict.startswith("verified") or final_verdict == "verifiable_judge") \
+            and cfg.enable_categorize and passing_trial_dir:
         from .categorize import categorize
         c = categorize(
             row=row,

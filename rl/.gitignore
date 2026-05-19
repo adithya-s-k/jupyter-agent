@@ -10,9 +10,21 @@ data/raw/
 data/classified.parquet
 # Stage-2/3 verification outputs (state.jsonl, trials/, etc.).
 data/verification/
+# Keep the human-readable summary reports — small and load-bearing.
+!data/verification/**/REPORT.md
 # data/splits/ IS committed — those IDs are the source of truth.
 # Override the top-level *.parquet ignore for the split manifests only.
 !data/splits/*.parquet
+# Local snapshots of the splits before edits — kept on disk for safety, not in git.
+data/splits/_backup/
+
+# Per-condition ablation runs: keep decisions.csv + runs.csv (small + load-bearing)
+# but exclude the per-run trial dirs which can be 5-10MB each.
+data/ablation/*/runs/
+data/ablation/*/logs/
+
+# Local scratch + downloaded HF snapshots — regenerable.
+cache/
 
 # Generated Harbor task suites. Canonical home is the HF Hub dataset repo.
 # Always regenerable via scripts/05_build_tasks.py (or legacy build_harbor_tasks.py).

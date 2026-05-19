@@ -60,6 +60,31 @@ def cmd_run(args) -> int:
         print("no rows selected — check --ids / --from / --to / --limit / --manifest", file=sys.stderr)
         return 2
 
+    # --stage preset: applied BEFORE --all-oss so OSS can still take precedence.
+    # Two-stage model:
+    #   1 = Sonnet anchor screen. No doctor. Categorize on pass (so passers get L1-L4).
+    #       Failures land in phase_b_failed and become the input to Stage 2.
+    #   2 = Doctor pass on Stage-1 failures. Doctor probes use the default closed-frontier
+    #       roster (nano, opus, gpt-5.5, gpt-5.5-codex) and may rewrite spec / change reward
+    #       mode / correct gold / drop. Phase B re-runs on rewrite. Categorize on recovery.
+    # Stage 2 expects --ids-from <phase_b_failed task ids> so the redundant Phase B
+    # before doctor runs only on tasks that need it.
+    if args.stage == "1":
+        args.skip_doctor = True
+        args.skip_categorize = False
+    elif args.stage == "2":
+        args.skip_doctor = False
+        args.skip_categorize = False
+        # Default Stage 2 to a lean probe roster: nano (cheap first probe) +
+        # gpt-5.5 (frontier confirm). Skips opus (~5-10 min/probe) and
+        # deepseek (~10 min/probe). Honors any explicit --probe-aliases.
+        if not args.probe_aliases:
+            args.probe_aliases = ["nano", "gpt-5.5"]
+    if args.stage:
+        print(f"[stage {args.stage}] preset applied: model={args.model} k_max={args.k_max} "
+              f"skip_doctor={args.skip_doctor} skip_categorize={args.skip_categorize}",
+              file=sys.stderr)
+
     # --all-oss preset: swap every LLM call site that was still on the
     # closed-source default. Explicit user-supplied values are respected.
     OSS_DEFAULT = "hf/Qwen/Qwen3-235B-A22B-Instruct-2507:nscale"
@@ -99,6 +124,7 @@ def cmd_run(args) -> int:
         categorize_model=args.categorize_model,
         run_empirical_probe=args.empirical_probe,
         probe_aliases=args.probe_aliases,
+        probe_timeout_sec=args.probe_timeout_sec,
         regrade_judge_model=args.regrade_judge_model,
     )
 
@@ -237,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--k-max", type=int, default=2,
                      help="adaptive K upper bound — one Sonnet retry before the doctor "
                           "fires (default 2). Catches flaky single failures cheaply.")
+    run.add_argument("--stage", choices=["1", "2"], default=None,
+                     help="Staged-verification preset (2 stages):\n"
+                          "  1 → Sonnet anchor + categorize-on-pass (skip doctor). Failures → phase_b_failed bucket.\n"
+                          "  2 → doctor pass on Stage-1 failures (multi-model probes; may rewrite spec / change reward / correct gold / drop) + categorize-on-recovery.\n"
+                          "Explicit --model / --k-max still override the preset.\n"
+                          "For Stage 2, pass --ids-from <phase_b_failed_ids> to limit scope.")
     run.add_argument("--sandbox", default="docker", choices=["docker", "e2b"])
     run.add_argument("--concurrent", type=int, default=1,
                      help="parallel task workers (default 1 = sequential)")
@@ -272,7 +304,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="model used by Phase D rubric judge")
     # Doctor probe set + regrade judge
     run.add_argument("--probe-aliases", nargs="+", default=None,
-                     help="restrict doctor probes to these aliases (e.g. qwen glm kimi)")
+                     help="restrict doctor probes to these aliases (e.g. qwen glm kimi). "
+                          "Default: all aliases. `--stage 2` defaults to {nano, gpt-5.5}.")
+    run.add_argument("--probe-timeout-sec", type=int, default=180,
+                     help="Per-probe wall-time cap (sec). Doctor's probes run a full "
+                          "Phase-B-style trial; capping here at 180s kills the long-tail "
+                          "outliers without losing most rescues. Independent of "
+                          "--subprocess-timeout-sec (which governs anchor trials).")
     run.add_argument("--regrade-judge-model", default="openai/gpt-5.4-nano",
                      help="LLM used by Phase B regrade's llm-judge fallback")
     # All-OSS preset

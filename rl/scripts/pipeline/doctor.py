@@ -293,7 +293,8 @@ class DoctorCtx:
     """All the runtime state a tool dispatcher might need."""
     def __init__(self, *, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
                  specs_archive_dir: Path, state, jobs_dir: Path,
-                 sandbox: str = "docker", subprocess_timeout_sec: int = 900):
+                 sandbox: str = "docker", subprocess_timeout_sec: int = 900,
+                 probe_timeout_sec: int = 180):
         self.row = row
         self.spec_dir = spec_dir
         self.trial_dirs = trial_dirs        # paths to Phase B trial dirs by k_idx (0-2)
@@ -303,6 +304,7 @@ class DoctorCtx:
         self.jobs_dir = jobs_dir
         self.sandbox = sandbox
         self.subprocess_timeout_sec = subprocess_timeout_sec
+        self.probe_timeout_sec = probe_timeout_sec
         self.bucket_files: list[str] | None = None
         self.v0_snapshotted = False
 
@@ -424,7 +426,7 @@ def _dispatch_tool(name: str, args: dict, ctx: DoctorCtx) -> tuple[str, dict]:
             job_name=job_name, jobs_dir=ctx.jobs_dir,
             sandbox=getattr(ctx, "sandbox", "docker"),
             log_dir=ctx.state.logs_dir,
-            subprocess_timeout_sec=getattr(ctx, "subprocess_timeout_sec", 900),
+            subprocess_timeout_sec=getattr(ctx, "probe_timeout_sec", 180),
             budget_remaining_sec=budget_fn() if budget_fn else None,
         )
         ctx.probe_trial_dirs.append(result.trial_dir)
@@ -517,6 +519,7 @@ def run_doctor(*, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
                model: str = DOCTOR_MODEL,
                sandbox: str = "docker",
                subprocess_timeout_sec: int = 900,
+               probe_timeout_sec: int = 180,
                budget_remaining_fn=None,
                probe_aliases: list[str] | None = None) -> DoctorResult:
     task_id = str(row["id"])
@@ -531,7 +534,8 @@ def run_doctor(*, row: Mapping, spec_dir: Path, trial_dirs: list[Path],
         active_probes = dict(ALLOWED_PROBE_MODELS)
     ctx = DoctorCtx(row=row, spec_dir=spec_dir, trial_dirs=trial_dirs,
                     specs_archive_dir=specs_archive_dir, state=state, jobs_dir=jobs_dir,
-                    sandbox=sandbox, subprocess_timeout_sec=subprocess_timeout_sec)
+                    sandbox=sandbox, subprocess_timeout_sec=subprocess_timeout_sec,
+                    probe_timeout_sec=probe_timeout_sec)
     ctx.budget_remaining_fn = budget_remaining_fn
     ctx.active_probes = active_probes
 
